@@ -1,0 +1,9 @@
+/build/
+/artifacts/
+/logs/
+/cache/
+/VaderHapticsLauncher.ini
+*.user
+*.pdb
+*.log
+.vs/

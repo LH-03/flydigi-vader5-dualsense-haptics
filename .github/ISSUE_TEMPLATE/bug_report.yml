@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible VaderHaptics problem.
+body:
+  - type: markdown
+    attributes:
+      value: Do not include game captures, controller serials, full hardware paths, or credentials.
+  - type: input
+    id: version
+    attributes:
+      label: VaderHaptics version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - USB
+        - Flydigi 2.4G receiver
+  - type: input
+    id: game
+    attributes:
+      label: Game and launch platform
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps and expected result
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Native recovery result
+      description: State whether Return Native succeeded and include only redacted relevant log lines.
+    validations:
+      required: true

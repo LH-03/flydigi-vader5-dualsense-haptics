@@ -1,0 +1,34 @@
+# VaderHaptics
+
+面向飞智黑武士 5 Pro 的 Windows 震动中间件。它让支持原生 USB DualSense
+震动的游戏看到一个虚拟 DualSense，尽可能保留游戏的震动信息，再映射到手柄的
+左右握把与左右扳机震动通道。
+
+## 已验证与限制
+
+- 已验证：Windows 10/11 x64、黑武士 5 Pro 的 USB 与飞智 2.4G 接收器；
+  《最后生还者 Part I》是唯一经过完整实机验证的游戏。
+- 可尝试：其他原生 USB DualSense 震动正常的游戏。它们不是兼容性承诺。
+- 不支持：蓝牙、Xbox Enhanced、扳机阻尼/阻力、RGB、宏、键鼠映射、摇杆曲线、
+  修改游戏 UI，以及任何反作弊绕过。
+
+## 使用前必须知道
+
+PS5 Enhanced 会暂时关闭飞智空间站并使用 HidHide 隐藏游戏可见的物理手柄，
+避免双输入。退出、失败或点击 **Return Native** 时会归零并恢复原始设备可见性。
+手柄配置（尤其是扩展键）请先在 Native 状态下用飞智空间站保存；增强模式只把
+已映射为普通手柄按键的扩展键转换为 DS5 输入，键盘、鼠标、宏等映射不会接管。
+
+## 安装
+
+完整步骤见 [docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。简版流程：
+
+1. 从官方来源安装 HidHide 和兼容版本的 VIIPER；本项目不捆绑它们。
+2. 构建或下载发布包后，复制
+   `VaderHapticsLauncher.ini.example` 为 `VaderHapticsLauncher.ini`。
+3. 在该 INI 中填写飞智空间站的安装目录。
+4. 以管理员身份运行 `VaderHaptics.exe`，需要增强时点 **Start PS5 Enhanced**；
+   完成后点 **Return Native**。
+
+出问题时，不要反复热插拔或让增强模式继续运行：先点击 **Return Native**，再查看
+发布包中的 `logs` 目录并提交问题报告。
