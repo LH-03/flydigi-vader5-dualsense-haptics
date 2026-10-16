@@ -51,7 +51,9 @@
 namespace
 {
 constexpr const char* kApiHost = "127.0.0.1";
-constexpr int kApiPort = 3242;
+// App-owned endpoints, independent of VIIPER's commonly reserved defaults.
+constexpr int kApiPort = 43242;
+constexpr int kUsbPort = 43241;
 constexpr const char* kDeviceType = "dualsensecombinedaudioduplexv5";
 constexpr const char* kBridgeStopEventName =
     "Local\\VaderHapticsBridgeGracefulStop";
@@ -1305,6 +1307,37 @@ bool PingViiper(std::string& version, int timeoutMs = 3000)
     return !response.empty();
 }
 
+std::vector<char> ViiperEnvironment()
+{
+    // Configure only the child. GUI builds can inject their own `server`
+    // command; upstream's documented environment options survive that path.
+    std::vector<std::string> entries;
+    LPCH environment = GetEnvironmentStringsA();
+    if (environment) {
+        for (const char* entry = environment; *entry; entry += std::strlen(entry) + 1) {
+            if (_strnicmp(entry, "VIIPER_USB_ADDR=", 16) == 0 ||
+                _strnicmp(entry, "VIIPER_API_ADDR=", 16) == 0) continue;
+            entries.emplace_back(entry);
+        }
+        FreeEnvironmentStringsA(environment);
+    }
+    for (const auto& entry : {
+        "VIIPER_USB_ADDR=127.0.0.1:" + std::to_string(kUsbPort),
+        "VIIPER_API_ADDR=127.0.0.1:" + std::to_string(kApiPort)}) {
+        entries.push_back(entry);
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return _stricmp(a.c_str(), b.c_str()) < 0;
+    });
+    std::vector<char> result;
+    for (const auto& entry : entries) {
+        result.insert(result.end(), entry.begin(), entry.end());
+        result.push_back('\0');
+    }
+    result.push_back('\0');
+    return result;
+}
+
 bool StartViiperServer(DWORD& pid, const std::string& logPath =
     ExpandEnv("%TEMP%\\viiper_server_bridge.log"))
 {
@@ -1334,8 +1367,10 @@ bool StartViiperServer(DWORD& pid, const std::string& logPath =
         si.hStdInput = input;
     }
     PROCESS_INFORMATION pi = {};
+    auto environment = ViiperEnvironment();
+    std::printf("VIIPER endpoints: usb=127.0.0.1:%d api=127.0.0.1:%d\n", kUsbPort, kApiPort);
     if (!CreateProcessA(exe.c_str(), args.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            CREATE_NO_WINDOW, environment.data(), nullptr, &si, &pi)) {
         std::printf("ERROR: VIIPER process launch failed (Windows error %lu)\n", GetLastError());
         CloseHandle(input);
         if (logFile != INVALID_HANDLE_VALUE) {
@@ -1395,7 +1430,11 @@ int RunViiperStartupSelfTest()
     const std::string log{std::istreambuf_iterator<char>(input), {}};
     input.close();
     DeleteFileA(logPath.c_str());
-    const bool passed = !started && elapsed < 2500 && log.find("usage:") != std::string::npos;
+    const auto environment = ViiperEnvironment();
+    const std::string environmentText(environment.data(), environment.size());
+    const bool passed = !started && elapsed < 2500 && log.find("usage:") != std::string::npos
+        && environmentText.find("VIIPER_USB_ADDR=127.0.0.1:43241") != std::string::npos
+        && environmentText.find("VIIPER_API_ADDR=127.0.0.1:43242") != std::string::npos;
     std::printf("VIIPER_STARTUP_SELFTEST result=%s elapsed_ms=%llu captured_output=%u\n",
         passed ? "PASS" : "FAIL", elapsed, log.empty() ? 0u : 1u);
     return passed ? 0 : 1;

@@ -31,6 +31,8 @@ HWND g_window = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_detailLabel = nullptr;
 HWND g_pathLabel = nullptr;
+HWND g_diagnosticsWindow = nullptr;
+HWND g_diagnosticsText = nullptr;
 std::atomic<bool> g_busy = false;
 std::atomic<bool> g_expectedBridgeStop = false;
 HFONT g_titleFont = nullptr;
@@ -175,23 +177,24 @@ std::string ReadBridgeLog()
 std::wstring ReadBridgeFailure()
 {
     const auto log = ReadBridgeLog();
+    std::string serviceLog;
     if (log.find("VIIPER startup log:") != std::string::npos) {
         wchar_t temporary[32768] = {};
         const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(temporary)), temporary);
         if (length && length < std::size(temporary)) {
-            const auto serviceLog = ReadLogTail(std::filesystem::path(temporary) / L"viiper_server_bridge.log");
+            serviceLog = ReadLogTail(std::filesystem::path(temporary) / L"viiper_server_bridge.log");
             std::ofstream output(LogDirectory() / L"viiper.log", std::ios::binary | std::ios::trunc);
             output << (serviceLog.empty() ? "VIIPER did not produce output. See bridge.log for the process launch error or exit code.\n" : serviceLog);
         }
     }
-    return launcher::ExplainBridgeFailure(log);
+    return launcher::ExplainBridgeFailure(log, serviceLog);
 }
 
 void PostBridgeFailure(bool restored, const std::wstring& reason)
 {
     PostStatus(restored ? L"增强未保持运行 · 已恢复 Native"
                         : L"增强失败 · Native 恢复也未通过",
-        reason + (restored ? L"" : L"\r\n请先查看 native.log 确认恢复状态，暂勿重试增强。"));
+        reason + (restored ? L"" : L"\r\n恢复尚未成功，暂勿重试增强；点击“查看诊断”查看恢复结果。"));
 }
 
 bool StartProcess(const std::filesystem::path& exe,
@@ -609,7 +612,7 @@ void OpenFlydigiSettings()
         const bool ok = ReturnNative(true);
         PostStatus(ok ? L"飞智设置已就绪" : L"打开设置失败",
             ok ? L"空间站已打开；保存的配置会留在飞智板载配置中。"
-               : L"Native 恢复门未通过，请查看 native.log。");
+               : L"原生模式恢复未通过，请点击“查看诊断”查看原因和恢复结果。");
         g_busy = false;
     }).detach();
 }
@@ -627,17 +630,85 @@ void SwitchToNative(bool showSpaceStation)
             ok ? (steamOccupies
                     ? L"VaderHaptics 已释放；飞智设置仍会被后台 Steam 锁定。"
                     : L"手柄已交还飞智空间站，可以修改板载配置。")
-               : L"恢复门未通过；请打开 logs\\native.log 查看原因。");
+               : L"原生模式恢复未通过，请点击“查看诊断”查看原因和恢复结果。");
         g_busy = false;
     }).detach();
 }
 
-void OpenLogs()
+LRESULT CALLBACK DiagnosticsProcedure(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam)
 {
-    std::error_code error;
-    std::filesystem::create_directories(LogDirectory(), error);
-    ShellExecuteW(g_window, L"open", LogDirectory().c_str(), nullptr,
-        nullptr, SW_SHOWNORMAL);
+    switch (message) {
+    case WM_CREATE: {
+        g_diagnosticsText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE |
+            ES_READONLY | ES_AUTOVSCROLL, 16, 16, 650, 370, window, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(g_diagnosticsText, WM_SETFONT, reinterpret_cast<WPARAM>(g_smallFont), TRUE);
+        HWND copy = CreateWindowW(L"BUTTON", L"复制诊断信息", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            16, 402, 180, 36, window, reinterpret_cast<HMENU>(1), nullptr, nullptr);
+        SendMessageW(copy, WM_SETFONT, reinterpret_cast<WPARAM>(g_bodyFont), TRUE);
+        return 0;
+    }
+    case WM_SIZE:
+        MoveWindow(g_diagnosticsText, 16, 16, LOWORD(lParam) - 32,
+            HIWORD(lParam) - 80, TRUE);
+        MoveWindow(GetDlgItem(window, 1), 16, HIWORD(lParam) - 52, 180, 36, TRUE);
+        return 0;
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {500, 320};
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == 1) {
+            const int length = GetWindowTextLengthW(g_diagnosticsText);
+            HGLOBAL data = GlobalAlloc(GMEM_MOVEABLE, (static_cast<SIZE_T>(length) + 1) * sizeof(wchar_t));
+            if (!data) return 0;
+            auto* text = static_cast<wchar_t*>(GlobalLock(data));
+            if (!text) { GlobalFree(data); return 0; }
+            GetWindowTextW(g_diagnosticsText, text, length + 1);
+            GlobalUnlock(data);
+            bool copied = false;
+            if (OpenClipboard(window)) {
+                EmptyClipboard();
+                copied = SetClipboardData(CF_UNICODETEXT, data) != nullptr;
+                CloseClipboard();
+            }
+            if (!copied) GlobalFree(data);
+            SetWindowTextW(GetDlgItem(window, 1), copied ? L"已复制" : L"复制失败，请重试");
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY:
+        g_diagnosticsWindow = nullptr;
+        g_diagnosticsText = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenDiagnostics()
+{
+    if (!g_diagnosticsWindow) {
+        g_diagnosticsWindow = CreateWindowExW(0, L"VaderHapticsDiagnostics",
+            L"VaderHaptics · 诊断详情", WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT, 720, 520, g_window, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+    }
+    if (!g_diagnosticsWindow) return;
+    const auto bridge = ReadBridgeLog();
+    const auto service = bridge.find("VIIPER startup log:") != std::string::npos
+        ? ReadLogTail(LogDirectory() / L"viiper.log") : std::string{};
+    auto details = launcher::DiagnosticDetails(bridge, service,
+        ReadLogTail(LogDirectory() / L"native.log"));
+    if (g_busy.load() || BridgeActive()) {
+        details = L"当前仍在切换或运行中，下方为已有记录，不能作为本次最终结果。\r\n\r\n" + details;
+    }
+    SetWindowTextW(g_diagnosticsText, details.c_str());
+    SetWindowTextW(GetDlgItem(g_diagnosticsWindow, 1), L"复制诊断信息");
+    ShowWindow(g_diagnosticsWindow, SW_SHOWNORMAL);
+    SetForegroundWindow(g_diagnosticsWindow);
 }
 
 void SetControlFont(HWND control, HFONT font)
@@ -728,7 +799,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
         MakeButton(window, kStartButton, L"启动 PS5 增强", 36, 275, 250, 54);
         MakeButton(window, kNativeButton, L"返回 Native", 300, 275, 210, 54);
         MakeButton(window, kSettingsButton, L"打开飞智设置", 36, 347, 250, 46);
-        MakeButton(window, kLogButton, L"打开运行日志", 300, 347, 210, 46);
+        MakeButton(window, kLogButton, L"查看诊断", 300, 347, 210, 46);
         g_pathLabel = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, 42, 416, 465, 24,
             window, nullptr, nullptr, nullptr);
@@ -760,7 +831,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
         case kStartButton: StartEnhanced(); break;
         case kNativeButton: SwitchToNative(false); break;
         case kSettingsButton: OpenFlydigiSettings(); break;
-        case kLogButton: OpenLogs(); break;
+        case kLogButton: OpenDiagnostics(); break;
         case kPathButton: ConfigureSpaceStation(); break;
         }
         return 0;
@@ -861,6 +932,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     windowClass.hIconSm = windowClass.hIcon;
     if (!RegisterClassExW(&windowClass)) return 1;
+    WNDCLASSEXW diagnosticsClass = windowClass;
+    diagnosticsClass.lpfnWndProc = DiagnosticsProcedure;
+    diagnosticsClass.lpszClassName = L"VaderHapticsDiagnostics";
+    if (!RegisterClassExW(&diagnosticsClass)) return 1;
     g_window = CreateWindowExW(0, kWindowClass,
         L"VaderHaptics · Controller Runtime", WS_OVERLAPPED | WS_CAPTION |
         WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -872,6 +947,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     UpdateWindow(g_window);
     MSG message = {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (g_diagnosticsWindow && IsDialogMessageW(g_diagnosticsWindow, &message)) continue;
         if (!IsDialogMessageW(g_window, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);

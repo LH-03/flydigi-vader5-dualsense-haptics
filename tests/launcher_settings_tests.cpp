@@ -31,8 +31,15 @@ int main()
     check(!launcher::BridgeStartupReady(ready + "ERROR: stream send failed\n"), "startup error prevents success");
     check(launcher::ExplainBridgeFailure("ERROR: unfamiliar error\n").find(L"unfamiliar error") != std::wstring::npos,
         "unknown errors remain visible");
-    check(launcher::ExplainBridgeFailure("ERROR: could not start VIIPER server\n").find(L"viiper.log") != std::wstring::npos,
-        "VIIPER failure points to service log");
+    check(launcher::ExplainBridgeFailure("ERROR: could not start VIIPER server\n").find(L"查看诊断") != std::wstring::npos,
+        "VIIPER failure points to in-app diagnostics");
+    const std::string serviceError = "INFO secret-do-not-copy\nVIIPER: error: listen tcp :3241: bind: forbidden by its access permissions.\n";
+    check(launcher::ExplainBridgeFailure("ERROR: could not start VIIPER server\n", serviceError).find(L"通信端口") != std::wstring::npos,
+        "port bind failure translated for users");
+    const auto report = launcher::DiagnosticDetails("ERROR: could not start VIIPER server\n", serviceError, "MODE_NATIVE result=PASS\n");
+    check(report.find(L"secret-do-not-copy") == std::wstring::npos && report.find(L"bind:") != std::wstring::npos
+        && report.find(L"MODE_NATIVE result=PASS") != std::wstring::npos,
+        "copy report retains failure and recovery without service INFO secrets");
     check(launcher::ReadSpaceStationDirectory(ini).empty(), "missing configuration");
     check(!launcher::SaveSpaceStationDirectory(ini, root), "reject wrong folder");
     check(launcher::SaveSpaceStationDirectory(ini, station), "save new Chinese path");

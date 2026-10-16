@@ -2,6 +2,36 @@
 #include <windows.h>
 
 namespace launcher {
+namespace {
+std::wstring Wide(std::string_view text)
+{
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+        static_cast<int>(text.size()), nullptr, 0);
+    std::wstring result(size, L'\0');
+    if (size) MultiByteToWideChar(CP_UTF8, 0, text.data(),
+        static_cast<int>(text.size()), result.data(), size);
+    return result;
+}
+
+std::wstring RelevantLines(std::string_view log)
+{
+    std::wstring result;
+    while (!log.empty()) {
+        const auto end = log.find('\n');
+        const auto line = log.substr(0, end);
+        // Service INFO logs can contain an API password on first launch.
+        // Include only failure/recovery evidence in the UI and clipboard.
+        if (line.find("ERROR:") != line.npos || line.find("error:") != line.npos ||
+            line.find(" ERROR ") != line.npos || line.find("reject:") != line.npos ||
+            line.find("MODE_NATIVE result=") != line.npos) {
+            result += Wide(line) + L"\r\n";
+        }
+        if (end == log.npos) break;
+        log.remove_prefix(end + 1);
+    }
+    return result.empty() ? L"未记录到明确错误。\r\n" : result;
+}
+}
 bool BridgeStartupReady(std::string_view log)
 {
     return log.find("initial live input frame sent: yes") != log.npos
@@ -9,11 +39,15 @@ bool BridgeStartupReady(std::string_view log)
         && log.find("ERROR:") == log.npos;
 }
 
-std::wstring ExplainBridgeFailure(std::string_view log)
+std::wstring ExplainBridgeFailure(std::string_view log, std::string_view serviceLog)
 {
     if (log.find("ERROR: could not start VIIPER server") != log.npos) {
-        return L"VIIPER 虚拟手柄服务启动失败，手柄接管开关无需再改。"
-            L"点击“打开运行日志”查看 viiper.log 的具体错误；bridge.log 中有退出码或超时原因。";
+        if (serviceLog.find("bind:") != serviceLog.npos) {
+            return L"虚拟手柄服务的通信端口被系统限制或其他程序占用。"
+                L"手柄设置正常，无需再改接管开关。可先使用原生模式；点击“查看诊断”可直接查看并复制错误信息。";
+        }
+        return L"虚拟手柄服务启动失败，手柄接管开关无需再改。"
+            L"点击“查看诊断”，窗口会直接显示服务错误；可一键复制反馈，无需寻找日志文件。";
     }
     if (log.find("thirdPartyAllowed=0") != log.npos
         && log.find("reject: raw transport enable") != log.npos
@@ -26,19 +60,26 @@ std::wstring ExplainBridgeFailure(std::string_view log)
         return L"手柄输入连接中断。请确认 USB 或 2.4G 接收器连接正常，再启动增强。";
     }
     if (log.find("ERROR: VIIPER feedback stream failed") != log.npos) {
-        return L"虚拟手柄反馈连接中断。请查看 VIIPER 是否正常运行，再启动增强；详细记录见“打开运行日志”。";
+        return L"虚拟手柄反馈连接中断。请重新启动增强；若仍失败，点击“查看诊断”复制错误信息。";
     }
     const auto error = log.rfind("ERROR:");
     if (error != log.npos) {
         const auto end = log.find_first_of("\r\n", error);
         const auto line = log.substr(error, end == log.npos ? log.npos : end - error);
-        const int size = MultiByteToWideChar(CP_UTF8, 0, line.data(),
-            static_cast<int>(line.size()), nullptr, 0);
-        std::wstring text(size, L'\0');
-        if (size) MultiByteToWideChar(CP_UTF8, 0, line.data(),
-            static_cast<int>(line.size()), text.data(), size);
-        return L"桥接报告：" + text + L"\r\n点击“打开运行日志”查看 bridge.log；恢复记录在 native.log。";
+        return L"增强未能正常运行：" + Wide(line) + L"\r\n点击“查看诊断”可直接查看并复制详情。";
     }
-    return L"桥接停止或未完成启动，日志未提供明确错误。点击“打开运行日志”查看 bridge.log 和 native.log。";
+    return L"增强停止或未完成启动，尚未收到明确原因。请点击“查看诊断”复制当前状态反馈。";
+}
+
+std::wstring DiagnosticDetails(std::string_view bridge, std::string_view service,
+    std::string_view recovery)
+{
+    const auto summary = bridge.empty() ? std::wstring(L"还没有运行记录。请先在主窗口启动增强。")
+        : (BridgeStartupReady(bridge) ? std::wstring(L"已有启动检查通过的记录，未发现明确错误；当前模式以主窗口为准。")
+                                    : ExplainBridgeFailure(bridge, service));
+    return L"【原因与建议】\r\n" + summary
+        + L"\r\n\r\n【虚拟手柄服务】\r\n" + RelevantLines(service)
+        + L"\r\n【接管程序】\r\n" + RelevantLines(bridge)
+        + L"\r\n【最近一次恢复记录】\r\n" + RelevantLines(recovery);
 }
 }
