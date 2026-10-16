@@ -770,6 +770,14 @@ int RunInputMappingSelfTest()
             (kBtnCross | kBtnR1 | kBtnL2) &&
         expandedPayload[9] == 255;
 
+    uint8_t renewalReply[33] = {0, 0x5A, 0xA5, 0x1C};
+    VaderState packetState;
+    bool commandReplyPass = !DecodeVaderReport(renewalReply, sizeof(renewalReply), packetState);
+    renewalReply[3] = 0x01;
+    commandReplyPass = commandReplyPass && !DecodeVaderReport(renewalReply, sizeof(renewalReply), packetState);
+    renewalReply[3] = 0xEF;
+    commandReplyPass = commandReplyPass && DecodeVaderReport(renewalReply, sizeof(renewalReply), packetState);
+
     const bool pass = static_cast<int8_t>(payload[0]) == -128 &&
         static_cast<int8_t>(payload[1]) == -128 &&
         static_cast<int8_t>(payload[2]) == 127 &&
@@ -777,7 +785,7 @@ int RunInputMappingSelfTest()
         buttons == 0x0000FFF0 && payload[8] == 0x09 &&
         payload[9] == 1 && payload[10] == 255 &&
         payload[15] == kTouchInactive && payload[20] == kTouchInactive &&
-        Load16LE(payload + 31) == -8192 && staleGatePass && expansionPass;
+        Load16LE(payload + 31) == -8192 && staleGatePass && expansionPass && commandReplyPass;
     std::printf(
         "INPUT_MAPPING_SELFTEST result=%s lx=%d ly=%d rx=%d ry=%d "
         "buttons=0x%08X dpad=0x%02X l2=%u r2=%u expansion=%u\n",
@@ -837,14 +845,26 @@ bool WriteHidWithTimeout(HANDLE handle, const uint8_t* data, DWORD size)
         return false;
     }
     bool ok = false;
+    bool completionObserved = false;
+    DWORD transferred = 0;
     if (WriteFile(handle, data, size, nullptr, &overlapped)) {
         ok = true;
     }
     else if (GetLastError() == ERROR_IO_PENDING) {
-        ok = WaitForSingleObject(overlapped.hEvent, 2000) == WAIT_OBJECT_0;
+        if (WaitForSingleObject(overlapped.hEvent, 2000) == WAIT_OBJECT_0) {
+            ok = true;
+        }
+        else {
+            CancelIoEx(handle, &overlapped);
+            ok = GetOverlappedResult(handle, &overlapped, &transferred, TRUE) != 0;
+            completionObserved = true;
+        }
+    }
+    if (ok && !completionObserved) {
+        ok = GetOverlappedResult(handle, &overlapped, &transferred, FALSE) != 0;
     }
     CloseHandle(overlapped.hEvent);
-    return ok;
+    return ok && transferred == size;
 }
 
 bool SendAcquire(HANDLE handle, int outputLength, bool acquire)
@@ -892,6 +912,56 @@ bool SendStatusRequest(HANDLE handle, int outputLength)
     request[3] = 0x10;
     return WriteHidWithTimeout(handle, request.data(), request.size());
 }
+
+class VaderAcquireHeartbeat
+{
+public:
+    ~VaderAcquireHeartbeat() { Stop(); }
+
+    bool Start(const HidDeviceInfo& device)
+    {
+        handle_ = CreateFileW(device.devicePath.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) return false;
+        stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stop_) { CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE; return false; }
+        const int outputLength = device.outputReportByteLength;
+        worker_ = std::thread([this, outputLength] {
+            // SDL Flydigi V2 renews ACQUIRE + GET_INFO every 30 seconds.
+            // This maintenance worker never reads from the live input handle.
+            while (WaitForSingleObject(stop_, 30000) == WAIT_TIMEOUT) {
+                if (!SendAcquire(handle_, outputLength, true) ||
+                    !SendInfoRequest(handle_, outputLength)) {
+                    failed_ = true;
+                    return;
+                }
+                ++renewals_;
+            }
+        });
+        return true;
+    }
+
+    void Stop()
+    {
+        if (stop_) SetEvent(stop_);
+        if (worker_.joinable()) worker_.join();
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+        if (stop_) CloseHandle(stop_);
+        handle_ = INVALID_HANDLE_VALUE;
+        stop_ = nullptr;
+    }
+
+    bool failed() const { return failed_.load(); }
+    unsigned renewals() const { return renewals_.load(); }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    HANDLE stop_ = nullptr;
+    std::thread worker_;
+    std::atomic<bool> failed_{false};
+    std::atomic<unsigned> renewals_{0};
+};
 
 bool SendReadOnlyFlydigiRequest(
     HANDLE handle, int outputLength, uint8_t command)
@@ -2439,7 +2509,18 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         [](vaderhaptics::VpcmError) {};
     vaderhaptics::VpcmParser parser(onFrame, onError);
 
+    VaderAcquireHeartbeat acquireHeartbeat;
+    if (!acquireHeartbeat.Start(vader)) {
+        std::printf("ERROR: could not start Vader acquisition renewal worker\n");
+        runtimeFailed = true;
+        telemetry.runtimeFailed = true;
+    }
     while (!g_interrupted) {
+        if (acquireHeartbeat.failed()) {
+            std::printf("ERROR: Vader acquisition renewal failed; stopping safely\n");
+            runtimeFailed = true;
+            telemetry.runtimeFailed = true;
+        }
         if (runtimeFailed || traceWriter.failed()) {
             if (traceWriter.failed()) {
                 std::printf("ERROR: live haptic trace writer failed\n");
@@ -2685,9 +2766,13 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         }
     }
 
-    // M3.6 safety shutdown: zero motors, stop writer, reset renderer.
+    // Zero output immediately, then stop renewal before releasing ownership.
     outputBackend.StopAllMotors();
     outputBackend.Stop();
+    acquireHeartbeat.Stop();
+    std::printf("VADER_ACQUIRE_HEARTBEAT renewals=%u failed=%u\n",
+        acquireHeartbeat.renewals(), acquireHeartbeat.failed() ? 1u : 0u);
+    // M3.6 safety shutdown: reset renderer after output has stopped.
     renderer.Reset();
     triggerAdapter.Reset();
     traceWriter.Stop();

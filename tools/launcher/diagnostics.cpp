@@ -55,9 +55,12 @@ std::wstring ExplainBridgeFailure(std::string_view log, std::string_view service
         return L"手柄未允许第三方接管。点击下方“打开飞智设置”，在飞智空间站设置中"
             L"开启“允许第三方应用接管映射”，再回这里启动增强。若设置被锁定，请先正常退出 Steam。";
     }
+    if (log.find("ERROR: Vader acquisition renewal") != log.npos) {
+        return L"未能维持手柄接管，增强已停止。请确认手柄连接正常，再启动增强；反复失败可复制诊断信息反馈。";
+    }
     if (log.find("ordinary input source") != log.npos
-        && log.find("disconnected;") != log.npos) {
-        return L"手柄输入连接中断。请确认 USB 或 2.4G 接收器连接正常，再启动增强。";
+        && (log.find("disconnected;") != log.npos || log.find("sustained outage") != log.npos)) {
+        return L"运行中连续两秒没有收到手柄输入，增强已停止。请确认手柄连接正常再重试；这不代表启动时未接管成功。";
     }
     if (log.find("ERROR: VIIPER feedback stream failed") != log.npos) {
         return L"虚拟手柄反馈连接中断。请重新启动增强；若仍失败，点击“查看诊断”复制错误信息。";

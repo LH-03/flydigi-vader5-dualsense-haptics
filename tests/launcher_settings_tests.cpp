@@ -37,6 +37,8 @@ int main()
     check(launcher::ExplainBridgeFailure("ERROR: could not start VIIPER server\n", serviceError).find(L"通信端口") != std::wstring::npos,
         "port bind failure translated for users");
     const auto report = launcher::DiagnosticDetails("ERROR: could not start VIIPER server\n", serviceError, "MODE_NATIVE result=PASS\n");
+    check(launcher::ExplainBridgeFailure("ERROR: ordinary input source 'mi01' produced no sample for 2012737 us; sustained outage, stopping safely\n").find(L"连续两秒") != std::wstring::npos,
+        "runtime input outage explained separately from startup failure");
     check(report.find(L"secret-do-not-copy") == std::wstring::npos && report.find(L"bind:") != std::wstring::npos
         && report.find(L"MODE_NATIVE result=PASS") != std::wstring::npos,
         "copy report retains failure and recovery without service INFO secrets");
