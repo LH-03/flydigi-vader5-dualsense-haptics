@@ -48,6 +48,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Install-VaderHaptics.ps1 -Pac
 
 ## 恢复步骤
 
+如果窗口提示“手柄未允许第三方接管”：点击 **打开飞智设置**，在空间站的
+设置中开启 **允许第三方应用接管映射**，再回到启动器点击 **启动 PS5 增强**。
+设置被锁定时先正常退出 Steam。窗口会分别显示接管失败原因和 Native 恢复结果；
+“已恢复 Native”只表示清理成功，不表示增强曾经接管成功。
+
 如果游戏无输入、出现双输入或震动异常：
 
 1. 在启动器点 **返回 Native**，等待状态显示 Native 已恢复。

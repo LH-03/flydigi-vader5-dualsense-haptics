@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(VaderHaptics WIN32 main.cpp settings.cpp launcher.rc)
+add_executable(VaderHaptics WIN32 main.cpp settings.cpp diagnostics.cpp launcher.rc)
 target_compile_definitions(VaderHaptics PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(VaderHaptics PRIVATE comctl32 shell32 dwmapi msimg32 ole32 uuid)
 
@@ -17,7 +17,7 @@ if(MSVC)
 endif()
 
 if(BUILD_TESTING)
-    add_executable(launcher_settings_tests ../../tests/launcher_settings_tests.cpp settings.cpp)
+    add_executable(launcher_settings_tests ../../tests/launcher_settings_tests.cpp settings.cpp diagnostics.cpp)
     target_include_directories(launcher_settings_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(launcher_settings_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(MSVC)

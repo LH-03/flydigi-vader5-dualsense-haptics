@@ -5,6 +5,7 @@
 #include <shobjidl.h>
 #include <tlhelp32.h>
 #include "settings.h"
+#include "diagnostics.h"
 
 #include <atomic>
 #include <filesystem>
@@ -142,6 +143,34 @@ void PostStatus(std::wstring title, std::wstring detail)
         std::move(title), std::move(detail));
     PostMessageW(g_window, kStatusMessage, 0,
         reinterpret_cast<LPARAM>(payload));
+}
+
+std::string ReadBridgeLog()
+{
+    // Launcher worker only. Bound reads even after long game sessions.
+    HANDLE file = CreateFileW((LogDirectory() / L"bridge.log").c_str(),
+        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size)) { CloseHandle(file); return {}; }
+    constexpr DWORD capacity = 64 * 1024;
+    LARGE_INTEGER offset = {};
+    offset.QuadPart = size.QuadPart > capacity ? size.QuadPart - capacity : 0;
+    SetFilePointerEx(file, offset, nullptr, FILE_BEGIN);
+    std::string contents(capacity, '\0');
+    DWORD count = 0;
+    const BOOL read = ReadFile(file, contents.data(), capacity, &count, nullptr);
+    CloseHandle(file);
+    contents.resize(read ? count : 0);
+    return contents;
+}
+
+void PostBridgeFailure(bool restored, const std::wstring& reason)
+{
+    PostStatus(restored ? L"增强未保持运行 · 已恢复 Native"
+                        : L"增强失败 · Native 恢复也未通过",
+        reason + (restored ? L"" : L"\r\n请先查看 native.log 确认恢复状态，暂勿重试增强。"));
 }
 
 bool StartProcess(const std::filesystem::path& exe,
@@ -423,11 +452,9 @@ void WatchBridge(HANDLE process,
         while (g_busy.load()) Sleep(50);
         bool idle = false;
         if (!g_busy.compare_exchange_strong(idle, true)) return;
+        const auto reason = launcher::ExplainBridgeFailure(ReadBridgeLog());
         const bool restored = ReturnNative(false);
-        PostStatus(restored ? L"Native 已自动恢复" : L"自动恢复失败",
-            restored
-                ? L"增强进程已停止；飞智空间站已重新启动。"
-                : L"增强进程异常停止，请打开 logs\\native.log。");
+        PostBridgeFailure(restored, reason);
         g_busy = false;
     }).detach();
 }
@@ -488,10 +515,15 @@ void StartEnhanced()
             return;
         }
 
+        PostStatus(L"正在建立增强连接", L"等待手柄输入、虚拟 DualSense 和震动输出完成启动…");
         bool active = false;
-        for (int i = 0; i < 120; ++i) {
-            if (BridgeActive()) { active = true; break; }
+        for (int i = 0; i < 600; ++i) {
             if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) break;
+            if (BridgeActive() && launcher::BridgeStartupReady(ReadBridgeLog())
+                && WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+                active = true;
+                break;
+            }
             Sleep(100);
         }
         if (active) {
@@ -500,10 +532,11 @@ void StartEnhanced()
             WatchBridge(process, std::move(profileSnapshot));
         }
         else {
+            const auto reason = launcher::ExplainBridgeFailure(ReadBridgeLog());
             CloseHandle(process);
-            ReturnNative(false);
+            const bool restored = ReturnNative(false);
             RemoveProfileSnapshot(profileSnapshot);
-            PostStatus(L"启动失败", L"桥接程序未通过启动门；已自动恢复 Native。");
+            PostBridgeFailure(restored, reason);
         }
         g_busy = false;
     }).detach();
@@ -640,35 +673,36 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
         const bool bridgeActive = BridgeActive();
         const bool steamOccupies = !ProcessIds(L"steam.exe").empty();
         g_statusLabel = CreateWindowW(L"STATIC",
-            bridgeActive ? L"PS5 增强已接管"
+            bridgeActive ? L"增强进程存在 · 状态待确认"
                          : (steamOccupies ? L"Native · Steam 正在接管"
                                           : L"Native · 等待启动"),
             WS_CHILD | WS_VISIBLE, 52, 105, 420, 30, window, nullptr,
             nullptr, nullptr);
         SetControlFont(g_statusLabel, g_bodyFont);
         g_detailLabel = CreateWindowW(L"STATIC",
-            bridgeActive ? L"虚拟 DualSense 正在运行 · 飞智设置暂时锁定"
+            bridgeActive ? L"检测到已有桥接进程；是否完成接管请查看运行日志。"
                          : (steamOccupies
                             ? L"VaderHaptics 已释放 · 飞智设置仍被后台 Steam 锁定"
                             : L"原生手柄输入可用 · 飞智空间站可以设置"),
-            WS_CHILD | WS_VISIBLE, 52, 139, 442, 48, window, nullptr,
+            WS_CHILD | WS_VISIBLE, 52, 139, 442, 108, window, nullptr,
             nullptr, nullptr);
         SetControlFont(g_detailLabel, g_smallFont);
-        MakeButton(window, kStartButton, L"启动 PS5 增强", 36, 205, 250, 54);
-        MakeButton(window, kNativeButton, L"返回 Native", 300, 205, 210, 54);
-        MakeButton(window, kSettingsButton, L"打开飞智设置", 36, 277, 250, 46);
-        MakeButton(window, kLogButton, L"打开运行日志", 300, 277, 210, 46);
+        MakeButton(window, kStartButton, L"启动 PS5 增强", 36, 275, 250, 54);
+        MakeButton(window, kNativeButton, L"返回 Native", 300, 275, 210, 54);
+        MakeButton(window, kSettingsButton, L"打开飞智设置", 36, 347, 250, 46);
+        MakeButton(window, kLogButton, L"打开运行日志", 300, 347, 210, 46);
         g_pathLabel = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, 42, 346, 465, 24,
+            WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, 42, 416, 465, 24,
             window, nullptr, nullptr, nullptr);
         SetControlFont(g_pathLabel, g_smallFont);
         DetectSpaceStation();
         RefreshPathLabel();
-        MakeButton(window, kPathButton, L"选择空间站目录…", 36, 378, 474, 38);
+        MakeButton(window, kPathButton, L"选择空间站目录…", 36, 448, 474, 38);
         HWND note = CreateWindowW(L"STATIC",
-            L"增强模式会临时关闭空间站；返回 Native 后会完整释放接管。\r\n"
-            L"拓展键若映射为手柄键会转成 DS5；键盘、宏和连发保持 Native 专属。",
-            WS_CHILD | WS_VISIBLE, 42, 438, 465, 52, window, nullptr,
+            L"首次使用：在飞智设置中开启“允许第三方应用接管映射”。\r\n"
+            L"增强期间空间站暂时关闭；返回 Native 后释放接管。\r\n"
+            L"扩展键仅兼容普通手柄键映射。",
+            WS_CHILD | WS_VISIBLE, 42, 508, 465, 72, window, nullptr,
             nullptr, nullptr);
         SetControlFont(note, g_smallFont);
         SetTimer(window, kButtonTimer, 150, nullptr);
@@ -705,7 +739,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
             EnableWindow(GetDlgItem(window, kSettingsButton), !busy);
             EnableWindow(GetDlgItem(window, kPathButton), !busy && !active);
             SetWindowTextW(GetDlgItem(window, kStartButton),
-                busy ? L"正在处理，请稍候…" : (active ? L"PS5 增强运行中" : L"启动 PS5 增强"));
+                busy ? L"正在处理，请稍候…" : (active ? L"增强进程运行中" : L"启动 PS5 增强"));
         }
         return 0;
     case kStatusMessage: {
@@ -726,14 +760,14 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
             {client.right, client.bottom, 0x1100, 0x1820, 0x2500, 0}};
         GRADIENT_RECT gradient = {0, 1};
         GradientFill(dc, vertices, 2, &gradient, 1, GRADIENT_FILL_RECT_V);
-        RECT card = {36, 92, 510, 190};
+        RECT card = {36, 92, 510, 258};
         HBRUSH cardBrush = CreateSolidBrush(RGB(18, 24, 34));
         FillRect(dc, &card, cardBrush);
         DeleteObject(cardBrush);
         HPEN accent = CreatePen(PS_SOLID, 3, RGB(31, 143, 255));
         HGDIOBJ old = SelectObject(dc, accent);
         MoveToEx(dc, 36, 92, nullptr);
-        LineTo(dc, 36, 190);
+        LineTo(dc, 36, 258);
         SelectObject(dc, old);
         DeleteObject(accent);
         EndPaint(window, &paint);
@@ -792,7 +826,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     g_window = CreateWindowExW(0, kWindowClass,
         L"VaderHaptics · Controller Runtime", WS_OVERLAPPED | WS_CAPTION |
         WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
-        566, 550, nullptr, nullptr, instance, nullptr);
+        566, 640, nullptr, nullptr, instance, nullptr);
     if (!g_window) return 1;
     const BOOL dark = TRUE;
     DwmSetWindowAttribute(g_window, 20, &dark, sizeof(dark));
