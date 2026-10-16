@@ -304,7 +304,33 @@ bool ReadAll(SOCKET sock, std::string& out, int timeoutMs)
     return true;
 }
 
-bool ApiRequest(const std::string& request, std::string& response)
+bool ConnectWithTimeout(SOCKET sock, const sockaddr_in& address, int timeoutMs)
+{
+    u_long nonblocking = 1;
+    if (ioctlsocket(sock, FIONBIO, &nonblocking) != 0) return false;
+    bool connected = connect(sock, reinterpret_cast<const sockaddr*>(&address),
+        sizeof(address)) == 0;
+    if (!connected && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable, errors;
+        FD_ZERO(&writable);
+        FD_ZERO(&errors);
+        FD_SET(sock, &writable);
+        FD_SET(sock, &errors);
+        timeval timeout = {timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+        if (select(0, nullptr, &writable, &errors, &timeout) > 0) {
+            int error = 0;
+            int size = sizeof(error);
+            connected = getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                reinterpret_cast<char*>(&error), &size) == 0 && error == 0
+                && FD_ISSET(sock, &writable);
+        }
+    }
+    nonblocking = 0;
+    return ioctlsocket(sock, FIONBIO, &nonblocking) == 0 && connected;
+}
+
+bool ApiRequest(const std::string& request, std::string& response,
+    int responseTimeoutMs = 3000)
 {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
@@ -319,12 +345,12 @@ bool ApiRequest(const std::string& request, std::string& response)
     inet_pton(AF_INET, kApiHost, &addr.sin_addr);
 
     bool ok = false;
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+    if (ConnectWithTimeout(sock, addr, 500)) {
         std::string wire = request;
         wire.push_back('\0');
         int sent = send(sock, wire.data(), static_cast<int>(wire.size()), 0);
         if (sent == static_cast<int>(wire.size())) {
-            ok = ReadAll(sock, response, 3000);
+            ok = ReadAll(sock, response, responseTimeoutMs);
         }
     }
     closesocket(sock);
@@ -1269,60 +1295,110 @@ HANDLE OpenSeparateVaderOutputHandle(const HidDeviceInfo& device)
     return handle;
 }
 
-bool PingViiper(std::string& version)
+bool PingViiper(std::string& version, int timeoutMs = 3000)
 {
     std::string response;
-    if (!ApiRequest("ping", response)) {
+    if (!ApiRequest("ping", response, timeoutMs)) {
         return false;
     }
     version = FindJsonValue(response, "version");
     return !response.empty();
 }
 
-bool StartViiperServer(DWORD& pid)
+bool StartViiperServer(DWORD& pid, const std::string& logPath =
+    ExpandEnv("%TEMP%\\viiper_server_bridge.log"))
 {
     std::string exe = g_viiperExe;
     std::string args = "\"" + exe + "\" server";
-    std::string logPath = ExpandEnv("%TEMP%\\viiper_server_bridge.log");
     SECURITY_ATTRIBUTES security = {};
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
-    HANDLE logFile = CreateFileA(logPath.c_str(), FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_ALWAYS,
+    HANDLE logFile = CreateFileA(logPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE input = CreateFileW(L"NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0, nullptr);
+    if (logFile == INVALID_HANDLE_VALUE || input == INVALID_HANDLE_VALUE) {
+        std::printf("ERROR: VIIPER log setup failed (Windows error %lu)\n", GetLastError());
+        if (logFile != INVALID_HANDLE_VALUE) CloseHandle(logFile);
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+        return false;
+    }
+    std::printf("VIIPER startup log: %s\n", logPath.c_str());
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     if (logFile != INVALID_HANDLE_VALUE) {
         si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = logFile;
         si.hStdError = logFile;
-        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdInput = input;
     }
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(exe.c_str(), args.data(), nullptr, nullptr, FALSE,
+    if (!CreateProcessA(exe.c_str(), args.data(), nullptr, nullptr, TRUE,
             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        std::printf("ERROR: VIIPER process launch failed (Windows error %lu)\n", GetLastError());
+        CloseHandle(input);
         if (logFile != INVALID_HANDLE_VALUE) {
             CloseHandle(logFile);
         }
         return false;
     }
+    CloseHandle(input);
     if (logFile != INVALID_HANDLE_VALUE) {
         CloseHandle(logFile);
     }
     CloseHandle(pi.hThread);
     pid = pi.dwProcessId;
 
-    for (int i = 0; i < 50; ++i) {
+    const auto deadline = GetTickCount64() + 8000;
+    while (GetTickCount64() < deadline) {
+        if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+            DWORD exitCode = 0;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            std::printf("ERROR: VIIPER exited before ready (exit code %lu); see %s\n",
+                exitCode, logPath.c_str());
+            CloseHandle(pi.hProcess);
+            return false;
+        }
+        if (g_bridgeStopEvent && WaitForSingleObject(g_bridgeStopEvent, 0) == WAIT_OBJECT_0) break;
         std::string version;
-        if (PingViiper(version)) {
+        if (PingViiper(version, 300) && WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) {
             CloseHandle(pi.hProcess);
             return true;
         }
-        Sleep(100);
     }
+    std::printf("ERROR: VIIPER startup timed out or was cancelled; see %s\n", logPath.c_str());
     TerminateProcess(pi.hProcess, 1);
+    WaitForSingleObject(pi.hProcess, 3000);
     CloseHandle(pi.hProcess);
     return false;
+}
+
+int RunViiperStartupSelfTest()
+{
+    // This executable has no `server` command: it prints usage and exits.
+    // Exercise real child-exit detection and stdout inheritance without VIIPER,
+    // controller access, driver operations or a virtual device.
+    char executable[32768] = {};
+    GetModuleFileNameA(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    g_viiperExe = executable;
+    const auto logPath = ExpandEnv("%TEMP%\\vader_viiper_startup_test_")
+        + std::to_string(GetCurrentProcessId()) + ".log";
+    WSADATA wsa = {};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+    DWORD pid = 0;
+    const auto start = GetTickCount64();
+    const bool started = StartViiperServer(pid, logPath);
+    const auto elapsed = GetTickCount64() - start;
+    WSACleanup();
+    std::ifstream input(logPath);
+    const std::string log{std::istreambuf_iterator<char>(input), {}};
+    input.close();
+    DeleteFileA(logPath.c_str());
+    const bool passed = !started && elapsed < 2500 && log.find("usage:") != std::string::npos;
+    std::printf("VIIPER_STARTUP_SELFTEST result=%s elapsed_ms=%llu captured_output=%u\n",
+        passed ? "PASS" : "FAIL", elapsed, log.empty() ? 0u : 1u);
+    return passed ? 0 : 1;
 }
 
 int RunUsbipDetach(int port)
@@ -4466,6 +4542,7 @@ int main(int argc, char** argv)
         g_viiperExe = ExpandEnv("%LOCALAPPDATA%\\VIIPER\\viiper.exe");
     }
     std::string command = argc > 1 ? argv[1] : "run";
+    if (command == "startup-selftest") return RunViiperStartupSelfTest();
     int duration = 0;
     std::string configPath;
     std::string commandsPath;

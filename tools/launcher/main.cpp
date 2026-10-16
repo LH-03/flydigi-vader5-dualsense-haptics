@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -145,10 +146,10 @@ void PostStatus(std::wstring title, std::wstring detail)
         reinterpret_cast<LPARAM>(payload));
 }
 
-std::string ReadBridgeLog()
+std::string ReadLogTail(const std::filesystem::path& path)
 {
     // Launcher worker only. Bound reads even after long game sessions.
-    HANDLE file = CreateFileW((LogDirectory() / L"bridge.log").c_str(),
+    HANDLE file = CreateFileW(path.c_str(),
         GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return {};
@@ -164,6 +165,26 @@ std::string ReadBridgeLog()
     CloseHandle(file);
     contents.resize(read ? count : 0);
     return contents;
+}
+
+std::string ReadBridgeLog()
+{
+    return ReadLogTail(LogDirectory() / L"bridge.log");
+}
+
+std::wstring ReadBridgeFailure()
+{
+    const auto log = ReadBridgeLog();
+    if (log.find("VIIPER startup log:") != std::string::npos) {
+        wchar_t temporary[32768] = {};
+        const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(temporary)), temporary);
+        if (length && length < std::size(temporary)) {
+            const auto serviceLog = ReadLogTail(std::filesystem::path(temporary) / L"viiper_server_bridge.log");
+            std::ofstream output(LogDirectory() / L"viiper.log", std::ios::binary | std::ios::trunc);
+            output << (serviceLog.empty() ? "VIIPER did not produce output. See bridge.log for the process launch error or exit code.\n" : serviceLog);
+        }
+    }
+    return launcher::ExplainBridgeFailure(log);
 }
 
 void PostBridgeFailure(bool restored, const std::wstring& reason)
@@ -452,7 +473,7 @@ void WatchBridge(HANDLE process,
         while (g_busy.load()) Sleep(50);
         bool idle = false;
         if (!g_busy.compare_exchange_strong(idle, true)) return;
-        const auto reason = launcher::ExplainBridgeFailure(ReadBridgeLog());
+        const auto reason = ReadBridgeFailure();
         const bool restored = ReturnNative(false);
         PostBridgeFailure(restored, reason);
         g_busy = false;
@@ -517,9 +538,15 @@ void StartEnhanced()
 
         PostStatus(L"正在建立增强连接", L"等待手柄输入、虚拟 DualSense 和震动输出完成启动…");
         bool active = false;
+        bool reportedServerStart = false;
         for (int i = 0; i < 600; ++i) {
             if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) break;
-            if (BridgeActive() && launcher::BridgeStartupReady(ReadBridgeLog())
+            const auto log = ReadBridgeLog();
+            if (!reportedServerStart && log.find("VIIPER server not running; starting it...") != std::string::npos) {
+                PostStatus(L"正在启动虚拟手柄服务", L"手柄接管已通过，正在等待 VIIPER；服务启动失败会显示具体错误。");
+                reportedServerStart = true;
+            }
+            if (BridgeActive() && launcher::BridgeStartupReady(log)
                 && WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
                 active = true;
                 break;
@@ -532,7 +559,18 @@ void StartEnhanced()
             WatchBridge(process, std::move(profileSnapshot));
         }
         else {
-            const auto reason = launcher::ExplainBridgeFailure(ReadBridgeLog());
+            if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+                HANDLE stop = OpenEventW(EVENT_MODIFY_STATE, FALSE, kBridgeEvent);
+                if (stop) { SetEvent(stop); CloseHandle(stop); }
+                if (WaitForSingleObject(process, 30000) != WAIT_OBJECT_0) {
+                    PostStatus(L"启动超时 · 正在等待桥接退出",
+                        L"桥接仍在停止中，尚未确认恢复 Native；请勿重复启动，详细原因见运行日志。");
+                    WatchBridge(process, std::move(profileSnapshot));
+                    g_busy = false;
+                    return;
+                }
+            }
+            const auto reason = ReadBridgeFailure();
             CloseHandle(process);
             const bool restored = ReturnNative(false);
             RemoveProfileSnapshot(profileSnapshot);

@@ -12,4 +12,6 @@ if(BUILD_TESTING)
              COMMAND flydigi_onboard_profile_tests)
     add_test(NAME bridge_input_mapping_selftest
              COMMAND vader_ds5_bridge input-selftest)
+    add_test(NAME bridge_startup_selftest
+             COMMAND vader_ds5_bridge startup-selftest)
 endif()

@@ -11,6 +11,10 @@ bool BridgeStartupReady(std::string_view log)
 
 std::wstring ExplainBridgeFailure(std::string_view log)
 {
+    if (log.find("ERROR: could not start VIIPER server") != log.npos) {
+        return L"VIIPER 虚拟手柄服务启动失败，手柄接管开关无需再改。"
+            L"点击“打开运行日志”查看 viiper.log 的具体错误；bridge.log 中有退出码或超时原因。";
+    }
     if (log.find("thirdPartyAllowed=0") != log.npos
         && log.find("reject: raw transport enable") != log.npos
         && log.find("M3 motor output:") == log.npos) {
