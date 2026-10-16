@@ -24,11 +24,11 @@ PS5 Enhanced 会暂时关闭飞智空间站并使用 HidHide 隐藏游戏可见�
 完整步骤见 [docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md)。简版流程：
 
 1. 从官方来源安装 HidHide 和兼容版本的 VIIPER；本项目不捆绑它们。
-2. 构建或下载发布包后，复制
-   `VaderHapticsLauncher.ini.example` 为 `VaderHapticsLauncher.ini`。
-3. 在该 INI 中填写飞智空间站的安装目录。
-4. 以管理员身份运行 `VaderHaptics.exe`，需要增强时点 **Start PS5 Enhanced**；
-   完成后点 **Return Native**。
+2. 构建或下载发布包后，双击 `VaderHaptics.exe`，确认管理员提示。
+3. 启动器会尝试识别正在运行的空间站；未识别时点 **选择空间站目录…**，
+   选一次即可记住，支持中文路径，无需编辑 INI。
+4. 需要增强时点 **启动 PS5 增强**，完成后点 **返回 Native**。
+   要改飞智配置可直接点 **打开飞智设置**。
 
 出问题时，不要反复热插拔或让增强模式继续运行：先点击 **Return Native**，再查看
 发布包中的 `logs` 目录并提交问题报告。

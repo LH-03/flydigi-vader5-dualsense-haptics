@@ -84,8 +84,8 @@ $cmake = Find-CMake
 $vsDevCmd = Find-VsDevCmd $cmake
 $ninja = Find-Ninja $cmake
 $ctest = Join-Path (Split-Path -Parent $cmake) 'ctest.exe'
-Invoke-Cmake @('-S', $root, '-B', $build, '-G', 'Ninja', ("-DCMAKE_MAKE_PROGRAM=$ninja"))
-Invoke-Cmake @('--build', $build, '--config', $Configuration, '--target', 'VaderHaptics', 'vader_ds5_bridge', 'flydigi_onboard_profile_tests')
+Invoke-Cmake @('-S', $root, '-B', $build, '-G', 'Ninja', ("-DCMAKE_MAKE_PROGRAM=$ninja"), ("-DCMAKE_BUILD_TYPE=$Configuration"))
+Invoke-Cmake @('--build', $build, '--config', $Configuration, '--target', 'VaderHaptics', 'vader_ds5_bridge', 'flydigi_onboard_profile_tests', 'launcher_settings_tests')
 & $ctest --test-dir $build -C $Configuration --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw 'Offline test run failed.' }
 
@@ -104,5 +104,6 @@ Copy-Item -LiteralPath (Join-Path $root 'assets\VaderHapticsLauncher.ini.example
 Copy-Item -LiteralPath (Join-Path $root 'README.zh-CN.md') -Destination (Join-Path $stage 'README.zh-CN.md')
 Copy-Item -LiteralPath (Join-Path $root 'docs\INSTALL.zh-CN.md') -Destination (Join-Path $stage 'INSTALL.zh-CN.md')
 Copy-Item -LiteralPath (Join-Path $root 'NOTICE.md') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
 
 Write-Host "Release package ready: $stage"

@@ -2,7 +2,9 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <tlhelp32.h>
+#include "settings.h"
 
 #include <atomic>
 #include <filesystem>
@@ -20,10 +22,13 @@ constexpr int kStartButton = 1001;
 constexpr int kNativeButton = 1002;
 constexpr int kSettingsButton = 1003;
 constexpr int kLogButton = 1004;
+constexpr int kPathButton = 1005;
+constexpr UINT_PTR kButtonTimer = 1;
 
 HWND g_window = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_detailLabel = nullptr;
+HWND g_pathLabel = nullptr;
 std::atomic<bool> g_busy = false;
 std::atomic<bool> g_expectedBridgeStop = false;
 HFONT g_titleFont = nullptr;
@@ -58,18 +63,14 @@ std::filesystem::path LogDirectory()
     return ExecutableDirectory() / L"logs";
 }
 
+std::filesystem::path SettingsPath()
+{
+    return ExecutableDirectory() / L"VaderHapticsLauncher.ini";
+}
+
 std::filesystem::path SpaceStationDirectory()
 {
-    const auto ini = ExecutableDirectory() / L"VaderHapticsLauncher.ini";
-    wchar_t value[32768] = {};
-    GetPrivateProfileStringW(L"paths", L"space_station_dir",
-        L"", value,
-        static_cast<DWORD>(std::size(value)), ini.c_str());
-    const std::filesystem::path configured = value;
-    std::error_code error;
-    return !configured.empty() &&
-            std::filesystem::is_directory(configured, error)
-        ? configured : std::filesystem::path{};
+    return launcher::ReadSpaceStationDirectory(SettingsPath());
 }
 
 std::filesystem::path FlydigiOnboardDirectory()
@@ -237,6 +238,104 @@ std::filesystem::path FirstProcessPath(const wchar_t* name)
                    : std::filesystem::path{};
 }
 
+void RefreshPathLabel()
+{
+    const auto directory = SpaceStationDirectory();
+    const auto label = directory.empty() ? L"空间站：未配置，请选择安装目录"
+        : L"空间站：" + directory.wstring();
+    SetWindowTextW(g_pathLabel, label.c_str());
+}
+
+bool DetectSpaceStation()
+{
+    if (!SpaceStationDirectory().empty()) return true;
+    for (const auto* name : {L"Flydigi Space Station.exe", L"SpaceStationService.exe"}) {
+        const auto directory = FirstProcessPath(name).parent_path();
+        if (launcher::IsSpaceStationDirectory(directory)
+            && launcher::SaveSpaceStationDirectory(SettingsPath(), directory)) return true;
+    }
+    return false;
+}
+
+bool SelectSpaceStation()
+{
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(result)) {
+        PostStatus(L"无法打开目录选择", L"请重新打开启动器后再试。");
+        return false;
+    }
+    DWORD options = 0;
+    result = dialog->GetOptions(&options);
+    if (SUCCEEDED(result)) result = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dialog->SetTitle(L"选择飞智空间站安装目录（包含 SpaceStationService.exe）");
+    if (SUCCEEDED(result)) result = dialog->Show(g_window);
+    std::filesystem::path directory;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(result)) result = dialog->GetResult(&item);
+    if (SUCCEEDED(result)) {
+        PWSTR path = nullptr;
+        result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+        if (SUCCEEDED(result)) directory = path;
+        CoTaskMemFree(path);
+        item->Release();
+    }
+    dialog->Release();
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return false;
+    if (FAILED(result) || !launcher::IsSpaceStationDirectory(directory)) {
+        PostStatus(L"请选择空间站安装目录",
+            L"目录中需要同时包含空间站程序和 SpaceStationService.exe。");
+        return false;
+    }
+    if (!launcher::SaveSpaceStationDirectory(SettingsPath(), directory)) {
+        PostStatus(L"路径未保存", L"无法写入启动器配置，请检查安装目录的写入权限。");
+        return false;
+    }
+    RefreshPathLabel();
+    PostStatus(L"空间站路径已保存", L"现在可以启动 PS5 增强；下次无需重新选择。");
+    return true;
+}
+
+bool EnsureSpaceStation()
+{
+    if (DetectSpaceStation()) {
+        RefreshPathLabel();
+        return true;
+    }
+    return SelectSpaceStation();
+}
+
+bool CheckEnhancedFiles()
+{
+    wchar_t localAppData[32768] = {};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
+        static_cast<DWORD>(std::size(localAppData)));
+    const std::pair<std::filesystem::path, const wchar_t*> required[] = {
+        {BridgePath(), L"缺少桥接程序，请重新解压完整程序包。"},
+        {ConfigPath(), L"缺少震动配置，请重新解压完整程序包。"},
+        {std::filesystem::path(localAppData) / L"VIIPER" / L"viiper.exe",
+            L"未找到 VIIPER，请按安装说明安装 v0.0.9 兼容运行时。"},
+        {L"C:\\Program Files\\Nefarius Software Solutions\\HidHide\\x64\\HidHideCLI.exe",
+            L"未找到 HidHide，请按安装说明安装后重试。"}
+    };
+    for (const auto& [path, detail] : required) {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error)) {
+            PostStatus(L"启动前检查未通过", detail);
+            return false;
+        }
+    }
+    return true;
+}
+
+void ConfigureSpaceStation()
+{
+    if (g_busy.exchange(true)) return;
+    if (!BridgeActive()) SelectSpaceStation();
+    g_busy = false;
+}
+
 bool ShutdownSteam()
 {
     const auto steam = FirstProcessPath(L"steam.exe");
@@ -336,6 +435,10 @@ void WatchBridge(HANDLE process,
 void StartEnhanced()
 {
     if (g_busy.exchange(true)) return;
+    if (BridgeActive() || !CheckEnhancedFiles() || !EnsureSpaceStation()) {
+        g_busy = false;
+        return;
+    }
     const bool steamRunning = !ProcessIds(L"steam.exe").empty();
     if (steamRunning) {
         const int answer = MessageBoxW(g_window,
@@ -351,12 +454,6 @@ void StartEnhanced()
         PostStatus(L"正在准备 PS5 增强", L"关闭飞智空间站并清理上一次会话…");
         if (steamRunning && !ShutdownSteam()) {
             PostStatus(L"Steam 仍在占用", L"请先手动退出 Steam，再重新启动增强模式。");
-            g_busy = false;
-            return;
-        }
-        if (SpaceStationDirectory().empty()) {
-            PostStatus(L"需要飞智路径",
-                L"请在 VaderHapticsLauncher.ini 填写 space_station_dir。");
             g_busy = false;
             return;
         }
@@ -415,7 +512,10 @@ void StartEnhanced()
 void OpenFlydigiSettings()
 {
     if (g_busy.exchange(true)) return;
-    if (BridgeActive()) g_expectedBridgeStop = true;
+    if (!EnsureSpaceStation()) {
+        g_busy = false;
+        return;
+    }
     const bool steamRunning = !ProcessIds(L"steam.exe").empty();
     if (steamRunning) {
         const int answer = MessageBoxW(g_window,
@@ -434,12 +534,7 @@ void OpenFlydigiSettings()
             g_busy = false;
             return;
         }
-        if (SpaceStationDirectory().empty()) {
-            PostStatus(L"需要飞智路径",
-                L"请在 VaderHapticsLauncher.ini 填写 space_station_dir。");
-            g_busy = false;
-            return;
-        }
+        if (BridgeActive()) g_expectedBridgeStop = true;
         const bool ok = ReturnNative(true);
         PostStatus(ok ? L"飞智设置已就绪" : L"打开设置失败",
             ok ? L"空间站已打开；保存的配置会留在飞智板载配置中。"
@@ -483,7 +578,7 @@ HWND MakeButton(HWND parent, int id, const wchar_t* text,
     int x, int y, int width, int height)
 {
     HWND button = CreateWindowW(L"BUTTON", text,
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x, y, width, height,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, x, y, width, height,
         parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetModuleHandleW(nullptr), nullptr);
     SetControlFont(button, g_bodyFont);
@@ -518,6 +613,10 @@ void DrawButton(const DRAWITEMSTRUCT& item)
     RECT rect = item.rcItem;
     DrawTextW(item.hDC, text, -1, &rect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if ((item.itemState & ODS_FOCUS) != 0) {
+        InflateRect(&rect, -4, -4);
+        DrawFocusRect(item.hDC, &rect);
+    }
 }
 
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
@@ -552,19 +651,27 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
                          : (steamOccupies
                             ? L"VaderHaptics 已释放 · 飞智设置仍被后台 Steam 锁定"
                             : L"原生手柄输入可用 · 飞智空间站可以设置"),
-            WS_CHILD | WS_VISIBLE, 52, 139, 460, 25, window, nullptr,
+            WS_CHILD | WS_VISIBLE, 52, 139, 442, 48, window, nullptr,
             nullptr, nullptr);
         SetControlFont(g_detailLabel, g_smallFont);
         MakeButton(window, kStartButton, L"启动 PS5 增强", 36, 205, 250, 54);
         MakeButton(window, kNativeButton, L"返回 Native", 300, 205, 210, 54);
         MakeButton(window, kSettingsButton, L"打开飞智设置", 36, 277, 250, 46);
         MakeButton(window, kLogButton, L"打开运行日志", 300, 277, 210, 46);
+        g_pathLabel = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS, 42, 346, 465, 24,
+            window, nullptr, nullptr, nullptr);
+        SetControlFont(g_pathLabel, g_smallFont);
+        DetectSpaceStation();
+        RefreshPathLabel();
+        MakeButton(window, kPathButton, L"选择空间站目录…", 36, 378, 474, 38);
         HWND note = CreateWindowW(L"STATIC",
             L"增强模式会临时关闭空间站；返回 Native 后会完整释放接管。\r\n"
             L"拓展键若映射为手柄键会转成 DS5；键盘、宏和连发保持 Native 专属。",
-            WS_CHILD | WS_VISIBLE, 42, 355, 465, 52, window, nullptr,
+            WS_CHILD | WS_VISIBLE, 42, 438, 465, 52, window, nullptr,
             nullptr, nullptr);
         SetControlFont(note, g_smallFont);
+        SetTimer(window, kButtonTimer, 150, nullptr);
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
@@ -582,6 +689,23 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
         case kNativeButton: SwitchToNative(false); break;
         case kSettingsButton: OpenFlydigiSettings(); break;
         case kLogButton: OpenLogs(); break;
+        case kPathButton: ConfigureSpaceStation(); break;
+        }
+        return 0;
+    case WM_TIMER:
+        if (wParam == kButtonTimer) {
+            const bool busy = g_busy.load();
+            const bool active = BridgeActive();
+            static int previousState = -1;
+            const int state = (busy ? 1 : 0) | (active ? 2 : 0);
+            if (state == previousState) return 0;
+            previousState = state;
+            EnableWindow(GetDlgItem(window, kStartButton), !busy && !active);
+            EnableWindow(GetDlgItem(window, kNativeButton), !busy);
+            EnableWindow(GetDlgItem(window, kSettingsButton), !busy);
+            EnableWindow(GetDlgItem(window, kPathButton), !busy && !active);
+            SetWindowTextW(GetDlgItem(window, kStartButton),
+                busy ? L"正在处理，请稍候…" : (active ? L"PS5 增强运行中" : L"启动 PS5 增强"));
         }
         return 0;
     case kStatusMessage: {
@@ -602,14 +726,14 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
             {client.right, client.bottom, 0x1100, 0x1820, 0x2500, 0}};
         GRADIENT_RECT gradient = {0, 1};
         GradientFill(dc, vertices, 2, &gradient, 1, GRADIENT_FILL_RECT_V);
-        RECT card = {36, 92, 510, 174};
+        RECT card = {36, 92, 510, 190};
         HBRUSH cardBrush = CreateSolidBrush(RGB(18, 24, 34));
         FillRect(dc, &card, cardBrush);
         DeleteObject(cardBrush);
         HPEN accent = CreatePen(PS_SOLID, 3, RGB(31, 143, 255));
         HGDIOBJ old = SelectObject(dc, accent);
         MoveToEx(dc, 36, 92, nullptr);
-        LineTo(dc, 36, 174);
+        LineTo(dc, 36, 190);
         SelectObject(dc, old);
         DeleteObject(accent);
         EndPaint(window, &paint);
@@ -636,6 +760,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        KillTimer(window, kButtonTimer);
         DeleteObject(g_titleFont);
         DeleteObject(g_bodyFont);
         DeleteObject(g_smallFont);
@@ -649,6 +774,8 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message,
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(com)) return 1;
     INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -665,7 +792,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     g_window = CreateWindowExW(0, kWindowClass,
         L"VaderHaptics · Controller Runtime", WS_OVERLAPPED | WS_CAPTION |
         WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
-        566, 470, nullptr, nullptr, instance, nullptr);
+        566, 550, nullptr, nullptr, instance, nullptr);
     if (!g_window) return 1;
     const BOOL dark = TRUE;
     DwmSetWindowAttribute(g_window, 20, &dark, sizeof(dark));
@@ -673,8 +800,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     UpdateWindow(g_window);
     MSG message = {};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        if (!IsDialogMessageW(g_window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
+    CoUninitialize();
     return static_cast<int>(message.wParam);
 }

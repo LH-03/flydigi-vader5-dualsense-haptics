@@ -31,7 +31,8 @@ may work, but are unverified.
 2. Build a release package with `powershell -ExecutionPolicy Bypass -File
    .\scripts\Build-Release.ps1`.
 3. Run `VaderHaptics.exe` as administrator from the generated package.
-4. Enter the Flydigi Space Station path in `VaderHapticsLauncher.ini`.
+4. A running Flydigi Space Station is detected automatically. Otherwise use
+   **选择空间站目录…** (Choose Space Station folder); the path is remembered.
 5. Use **Start PS5 Enhanced**. Use **Return Native** before changing Flydigi
    settings, disconnecting the controller, or troubleshooting.
 

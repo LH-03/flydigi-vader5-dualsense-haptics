@@ -26,7 +26,7 @@ if ($PSCmdlet.ShouldProcess($InstallDirectory, 'Install VaderHaptics package')) 
 }
 
 Write-Host "Installed to: $InstallDirectory"
-Write-Host 'Edit VaderHapticsLauncher.ini with your Flydigi Space Station directory before launching.'
+Write-Host 'Open VaderHaptics.exe; select your Flydigi Space Station directory in the launcher if it is not detected.'
 if ($Launch) {
     Start-Process -FilePath (Join-Path $InstallDirectory 'VaderHaptics.exe') -Verb RunAs
 }
