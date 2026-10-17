@@ -39,6 +39,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Install-VaderHaptics.ps1 -Pac
 
 ## 日常使用
 
+- 双框键（View）对应虚拟 DualSense 的触摸板按下，用于游戏的背包/制作等
+  次级菜单；不模拟触摸滑动。右侧菜单键对应 Options。
+- 面键按位置对应：飞智 A = PS 叉号，B = 圆圈，X = 方块，Y = 三角。
+
 - 需要原生 DS5 震动时，点击 **启动 PS5 增强**。启动器会关闭空间站、
   创建虚拟 DS5 并开始桥接。
 - 要修改飞智扩展键/震动设置，直接点击 **打开飞智设置**，它会先恢复 Native。

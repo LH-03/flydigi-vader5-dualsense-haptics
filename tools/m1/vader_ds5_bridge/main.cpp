@@ -88,6 +88,7 @@ constexpr uint32_t kBtnCreate = 0x1000;
 constexpr uint32_t kBtnOptions = 0x2000;
 constexpr uint32_t kBtnL3 = 0x4000;
 constexpr uint32_t kBtnR3 = 0x8000;
+constexpr uint32_t kBtnTouchpad = 0x00020000;
 
 volatile bool g_interrupted = false;
 
@@ -695,7 +696,9 @@ void MapToDs5(const NormalizedInputState& input, uint8_t payload[33])
     if (input.r1) buttons |= kBtnR1;
     if (input.l3) buttons |= kBtnL3;
     if (input.r3) buttons |= kBtnR3;
-    if (input.back) buttons |= kBtnCreate;
+    // Xbox View is the in-game secondary menu button. On the DS5 persona,
+    // expose its basic touchpad click (no touch coordinates or gestures).
+    if (input.back) buttons |= kBtnTouchpad;
     if (input.start) buttons |= kBtnOptions;
     if (input.l2 > 0) buttons |= kBtnL2;
     if (input.r2 > 0) buttons |= kBtnR2;
@@ -782,7 +785,7 @@ int RunInputMappingSelfTest()
         static_cast<int8_t>(payload[1]) == -128 &&
         static_cast<int8_t>(payload[2]) == 127 &&
         static_cast<int8_t>(payload[3]) == 127 &&
-        buttons == 0x0000FFF0 && payload[8] == 0x09 &&
+        buttons == 0x0002EFF0 && payload[8] == 0x09 &&
         payload[9] == 1 && payload[10] == 255 &&
         payload[15] == kTouchInactive && payload[20] == kTouchInactive &&
         Load16LE(payload + 31) == -8192 && staleGatePass && expansionPass && commandReplyPass;
@@ -1938,12 +1941,28 @@ class Mi01OrdinaryInputSource final : public OrdinaryInputSource
 public:
     Mi01OrdinaryInputSource(HANDLE handle, const VaderState& initial,
         const vaderhaptics::input::FlydigiOnboardProfile* expansionProfile)
-        : handle_(handle), initial_(initial)
+        : initial_(initial)
     {
+        if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(),
+                &handle_, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+        read_.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (expansionProfile) {
             expansionProfile_ = *expansionProfile;
             expansionMappingEnabled_ = true;
         }
+    }
+
+    ~Mi01OrdinaryInputSource() override
+    {
+        if (pending_) {
+            CancelIoEx(handle_, &read_);
+            DWORD ignored = 0;
+            GetOverlappedResult(handle_, &read_, &ignored, TRUE);
+        }
+        if (read_.hEvent) CloseHandle(read_.hEvent);
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
     }
 
     const char* name() const override
@@ -1958,6 +1977,7 @@ public:
 
     InputPollResult Poll(NormalizedInputState& state) override
     {
+        if (handle_ == INVALID_HANDLE_VALUE || !read_.hEvent) return InputPollResult::Disconnected;
         if (initialPending_) {
             initialPending_ = false;
             state = NormalizeMi01State(initial_);
@@ -1966,13 +1986,28 @@ public:
             }
             return InputPollResult::Sample;
         }
-        uint8_t report[64] = {};
-        DWORD read = 0;
-        if (!ReadHidWithTimeout(handle_, report, sizeof(report), 4, &read)) {
+        if (!pending_) {
+            ResetEvent(read_.hEvent);
+            if (!ReadFile(handle_, report_.data(), static_cast<DWORD>(report_.size()), nullptr, &read_)
+                && GetLastError() != ERROR_IO_PENDING) {
+                return InputPollResult::Disconnected;
+            }
+            pending_ = true;
+        }
+        // Keep the same read alive across short polling timeouts. Cancelling
+        // every 4 ms needlessly restarts the pending transfer under load.
+        if (WaitForSingleObject(read_.hEvent, 4) == WAIT_TIMEOUT) {
             return InputPollResult::NoSample;
         }
+        DWORD bytesRead = 0;
+        if (!GetOverlappedResult(handle_, &read_, &bytesRead, FALSE)) {
+            if (GetLastError() == ERROR_IO_INCOMPLETE) return InputPollResult::NoSample;
+            pending_ = false;
+            return InputPollResult::Disconnected;
+        }
+        pending_ = false;
         VaderState decoded;
-        if (!DecodeVaderReport(report, read, decoded)) {
+        if (!DecodeVaderReport(report_.data(), bytesRead, decoded)) {
             return InputPollResult::NoSample;
         }
         state = NormalizeMi01State(decoded);
@@ -1984,11 +2019,55 @@ public:
 
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
+    OVERLAPPED read_ = {};
+    std::array<uint8_t, 64> report_{};
+    bool pending_ = false;
     VaderState initial_;
     bool initialPending_ = true;
     vaderhaptics::input::FlydigiOnboardProfile expansionProfile_;
     bool expansionMappingEnabled_ = false;
 };
+
+int RunMi01ReadSelfTest()
+{
+    const std::wstring name = L"\\\\.\\pipe\\VaderHapticsInputTest-" + std::to_wstring(GetCurrentProcessId());
+    HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 64, 64, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) return 1;
+    HANDLE writer = CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (writer == INVALID_HANDLE_VALUE) { CloseHandle(pipe); return 1; }
+    OVERLAPPED connection = {};
+    connection.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool connected = ConnectNamedPipe(pipe, &connection) != FALSE;
+    if (!connected) connected = GetLastError() == ERROR_PIPE_CONNECTED;
+    if (connection.hEvent) CloseHandle(connection.hEvent);
+    bool pass = connected;
+    if (pass) {
+        VaderState initial;
+        Mi01OrdinaryInputSource source(pipe, initial, nullptr);
+        NormalizedInputState state;
+        pass = source.Poll(state) == InputPollResult::Sample;
+        // Let several poll windows expire before completing the same OS read.
+        for (int i = 0; i < 8; ++i) pass = (source.Poll(state) == InputPollResult::NoSample) && pass;
+        uint8_t report[33] = {0, 0x5A, 0xA5, 0xEF};
+        report[12] = 0x10; // physical A -> Cross, held throughout all samples
+        for (int i = 0; i < 20; ++i) {
+            DWORD written = 0;
+            pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && written == sizeof(report) && pass;
+            pass = (source.Poll(state) == InputPollResult::Sample && state.a) && pass;
+        }
+        report[12] = 0;
+        DWORD written = 0;
+        pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+        pass = (source.Poll(state) == InputPollResult::Sample && !state.a) && pass;
+        // Destruction must cancel/complete a still-pending read without a peer write.
+        pass = (source.Poll(state) == InputPollResult::NoSample) && pass;
+    }
+    CloseHandle(writer);
+    CloseHandle(pipe);
+    std::printf("MI01_READ_SELFTEST result=%s pending_timeout_hold_release_cleanup\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
 
 class XInputOrdinaryInputSource final : public OrdinaryInputSource
 {
@@ -2885,6 +2964,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         static_cast<unsigned long long>(inputNeutralizations),
         static_cast<long long>(maxInputGapUs));
 
+    inputSourceStorage.reset();
     std::printf("stopping bridge...\n");
     if (separateOutputHandle) {
         CloseHandle(outputHandle);
@@ -4667,6 +4747,7 @@ int main(int argc, char** argv)
     }
     std::string command = argc > 1 ? argv[1] : "run";
     if (command == "startup-selftest") return RunViiperStartupSelfTest();
+    if (command == "mi01-read-selftest") return RunMi01ReadSelfTest();
     int duration = 0;
     std::string configPath;
     std::string commandsPath;

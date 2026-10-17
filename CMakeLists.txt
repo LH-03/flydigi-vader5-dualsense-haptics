@@ -14,4 +14,6 @@ if(BUILD_TESTING)
              COMMAND vader_ds5_bridge input-selftest)
     add_test(NAME bridge_startup_selftest
              COMMAND vader_ds5_bridge startup-selftest)
+    add_test(NAME bridge_mi01_read_selftest
+             COMMAND vader_ds5_bridge mi01-read-selftest)
 endif()
