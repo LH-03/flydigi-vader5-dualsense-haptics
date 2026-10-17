@@ -28,8 +28,9 @@ may work, but are unverified.
 
 1. Read [docs/INSTALL.zh-CN.md](docs/INSTALL.zh-CN.md) and install the required
    external dependencies yourself.
-2. Build a release package with `powershell -ExecutionPolicy Bypass -File
-   .\scripts\Build-Release.ps1`.
+2. With Go 1.26.2 installed, run `powershell -ExecutionPolicy Bypass -File
+   .\scripts\Build-Viiper.ps1` to build the required input-fixed runtime, then
+   `powershell -ExecutionPolicy Bypass -File .\scripts\Build-Release.ps1`.
 3. Run `VaderHaptics.exe` as administrator from the generated package.
 4. A running Flydigi Space Station is detected automatically. Otherwise use
    **选择空间站目录…** (Choose Space Station folder); the path is remembered.

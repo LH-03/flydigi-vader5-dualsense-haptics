@@ -2,6 +2,7 @@
 /artifacts/
 /logs/
 /cache/
+/runtime/
 /VaderHapticsLauncher.ini
 *.user
 *.pdb

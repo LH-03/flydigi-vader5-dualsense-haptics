@@ -1,0 +1,7 @@
+diff --git a/device/dualsense/device.go b/device/dualsense/device.go
+--- a/device/dualsense/device.go
++++ b/device/dualsense/device.go
+@@ -296,1 +296,3 @@
+ 	res["speakerInterfaceActive"] = d.speakerInterfaceActive
++	res["vaderhapticsInputRevision"] = 1
++	res["inputQueueCapacity"] = inputQueueCapacity

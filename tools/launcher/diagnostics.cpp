@@ -41,6 +41,9 @@ bool BridgeStartupReady(std::string_view log)
 
 std::wstring ExplainBridgeFailure(std::string_view log, std::string_view serviceLog)
 {
+    if (log.find("VIIPER input queue fix is missing") != log.npos) {
+        return L"当前虚拟手柄运行时缺少按键队列修复，可能漏掉快速按下/松开。增强已停止，请安装配套的输入修复版运行时后再试。";
+    }
     if (log.find("ERROR: could not start VIIPER server") != log.npos) {
         if (serviceLog.find("bind:") != serviceLog.npos) {
             return L"虚拟手柄服务的通信端口被系统限制或其他程序占用。"

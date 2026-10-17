@@ -1,0 +1,406 @@
+diff --git a/device/dualsense/device.go b/device/dualsense/device.go
+index d1ffc25..db756eb 100644
+--- a/device/dualsense/device.go
++++ b/device/dualsense/device.go
+@@ -56,6 +56,7 @@ const (
+ 	outputTriggerLength      = 11
+ 	outputPlayerLedsOffset   = 44
+ 	outputLightbarOffset     = 45
++	inputQueueCapacity       = 8
+ )
+ 
+ type DualSense struct {
+@@ -63,6 +64,9 @@ type DualSense struct {
+ 	inputCh        chan InputState
+ 	inputState     InputState
+ 	inputPublishMu sync.Mutex
++	inputQueueEnqueued        uint64
++	inputQueueOverflowDropped uint64
++	inputQueueHighWater       int
+ 	metaState      *MetaState
+ 
+ 	atomicAudioHapticsFunc func(OutputState, []byte)
+@@ -187,7 +191,7 @@ func new(o *device.CreateOptions, edge bool) (*DualSense, error) {
+ 		"interfaces", len(d.descriptor.Interfaces))
+ 
+ 	d.inputState = *NewInputState()
+-	d.inputCh = make(chan InputState, 1)
++	d.inputCh = make(chan InputState, inputQueueCapacity)
+ 	d.inputCh <- d.inputState
+ 	d.timestampBase = time.Now()
+ 
+@@ -266,14 +270,75 @@ func (d *DualSense) UpdateInputState(state *InputState) {
+ 	d.inputState = next
+ 	d.mtx.Unlock()
+ 
+-	select {
+-	case <-d.inputCh:
+-	default:
++	for len(d.inputCh) >= inputQueueCapacity {
++		select {
++		case <-d.inputCh:
++			d.inputQueueOverflowDropped++
++		default:
++		}
+ 	}
+ 	select {
+ 	case d.inputCh <- next:
++		d.inputQueueEnqueued++
+ 	default:
+ 	}
++	if len(d.inputCh) > d.inputQueueHighWater {
++		d.inputQueueHighWater = len(d.inputCh)
++	}
++}
++
++type InputQueueTelemetry struct {
++	Capacity        int
++	Enqueued        uint64
++	OverflowDropped uint64
++	HighWater       int
++}
++
++func (d *DualSense) InputQueueTelemetry() InputQueueTelemetry {
++	d.inputPublishMu.Lock()
++	defer d.inputPublishMu.Unlock()
++	return InputQueueTelemetry{
++		Capacity:        inputQueueCapacity,
++		Enqueued:        d.inputQueueEnqueued,
++		OverflowDropped: d.inputQueueOverflowDropped,
++		HighWater:       d.inputQueueHighWater,
++	}
++}
++
++func (d *DualSense) ResetInputQueueToLatest() {
++	d.inputPublishMu.Lock()
++	defer d.inputPublishMu.Unlock()
++	d.mtx.Lock()
++	latest := d.inputState
++	d.mtx.Unlock()
++	d.resetInputQueueLocked(latest)
++}
++
++func (d *DualSense) ResetInputStateForStreamEnd() {
++	d.inputPublishMu.Lock()
++	defer d.inputPublishMu.Unlock()
++	neutral := *NewInputState()
++	d.mtx.Lock()
++	d.inputState = neutral
++	d.mtx.Unlock()
++	d.resetInputQueueLocked(neutral)
++}
++
++func (d *DualSense) resetInputQueueLocked(state InputState) {
++	for {
++		select {
++		case <-d.inputCh:
++		default:
++			goto drained
++		}
++	}
++
++drained:
++	d.inputCh <- state
++	d.inputQueueEnqueued++
++	if len(d.inputCh) > d.inputQueueHighWater {
++		d.inputQueueHighWater = len(d.inputCh)
++	}
+ }
+ 
+ func (d *DualSense) GetDescriptor() *usb.Descriptor {
+@@ -362,6 +427,9 @@ func (d *DualSense) SetInterfaceAltSetting(iface, alt uint8) {
+ // reset preserves the selected alternate setting and feature controls while
+ // discarding all transport data from the previous endpoint generation.
+ func (d *DualSense) ResetEndpoint(endpoint uint8) {
++	if endpoint == EndpointIn {
++		d.ResetInputQueueToLatest()
++	}
+ 	d.mtx.Lock()
+ 	var resetSpeaker func()
+ 	switch endpoint {
+diff --git a/device/dualsense/ds_handler.go b/device/dualsense/ds_handler.go
+index f97089d..266e688 100644
+--- a/device/dualsense/ds_handler.go
++++ b/device/dualsense/ds_handler.go
+@@ -194,6 +194,7 @@ func releaseDualSenseIdentity(devPtr *usb.Device, deviceName string) {
+ }
+ 
+ func readDualSenseV5InputStream(conn net.Conn, dse *DualSense, logger *slog.Logger) error {
++	defer dse.ResetInputStateForStreamEnd()
+ 	header := make([]byte, StreamFrameHeaderSize)
+ 	input := make([]byte, InputStateSize)
+ 	microphonePCM := make([]byte, USBMicrophoneClientFrameSize)
+diff --git a/device/dualsense/ds_handler_test.go b/device/dualsense/ds_handler_test.go
+index 358495a..e71757f 100644
+--- a/device/dualsense/ds_handler_test.go
++++ b/device/dualsense/ds_handler_test.go
+@@ -76,16 +76,43 @@ func TestReadDualSenseV5InputStreamAcceptsInterleavedStateAndMicrophone(t *testi
+ 	got := dev.inputState
+ 	queued := dev.microphoneBuffer.State().QueuedBytes
+ 	dev.mtx.Unlock()
+-	if got.LX != state.LX || got.Buttons != state.Buttons ||
+-		got.GyroX != state.GyroX || got.GyroY != state.GyroY ||
+-		got.AccelZ != state.AccelZ {
+-		t.Fatalf("V5 input changed: got=%+v want=%+v", got, state)
+-	}
++	assertNeutral(t, got)
+ 	if queued != USBMicrophoneClientFrameSize*microphoneTargetClientFrames {
+ 		t.Fatalf("queued microphone bytes=%d", queued)
+ 	}
+ }
+ 
++func TestReadDualSenseV5InputStreamEndNeutralizesActiveInput(t *testing.T) {
++	for _, active := range []struct {
++		name  string
++		state *InputState
++	}{
++		{"cross", crossInputState()},
++		{"ly", leftStickInputState()},
++	} {
++		t.Run(active.name, func(t *testing.T) {
++			dev, client, errCh := newV5ReaderTest(t)
++			payload, _ := active.state.MarshalBinary()
++			if _, err := client.Write(makeV5StreamFrame(StreamFrameInputState, 0, payload)); err != nil {
++				t.Fatalf("write state: %v", err)
++			}
++			_ = client.Close()
++			if err := <-errCh; err != nil {
++				t.Fatalf("reader: %v", err)
++			}
++			dev.mtx.Lock()
++			latest := dev.inputState
++			dev.mtx.Unlock()
++			assertNeutral(t, latest)
++			states := drainInput(dev)
++			if len(states) != 1 {
++				t.Fatalf("stream end queued %d states", len(states))
++			}
++			assertNeutral(t, states[0])
++		})
++	}
++}
++
+ func TestReadDualSenseV5InputStreamRejectsLegacyVersion(t *testing.T) {
+ 	_, client, errCh := newV5ReaderTest(t)
+ 	frame := makeV5StreamFrame(StreamFrameInputState, 0,
+diff --git a/device/dualsense/input_queue_test.go b/device/dualsense/input_queue_test.go
+new file mode 100644
+index 0000000..c18567a
+--- /dev/null
++++ b/device/dualsense/input_queue_test.go
+@@ -0,0 +1,214 @@
++package dualsense
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++func newQueueTestDevice(t *testing.T) *DualSense {
++	t.Helper()
++	dev, err := New(nil)
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	drainInput(dev)
++	return dev
++}
++
++func drainInput(dev *DualSense) []InputState {
++	var states []InputState
++	for {
++		select {
++		case state := <-dev.inputCh:
++			states = append(states, state)
++		default:
++			return states
++		}
++	}
++}
++
++func assertNeutral(t *testing.T, state InputState) {
++	t.Helper()
++	if state != *NewInputState() {
++		t.Fatalf("state is not neutral: %+v", state)
++	}
++}
++
++func crossInputState() *InputState {
++	state := NewInputState()
++	state.Buttons = ButtonCross
++	return state
++}
++
++func leftStickInputState() *InputState {
++	state := NewInputState()
++	state.LY = 91
++	return state
++}
++
++func TestInputQueuePreservesPressReleaseBurst(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	dev.UpdateInputState(crossInputState())
++	dev.UpdateInputState(NewInputState())
++	states := drainInput(dev)
++	if len(states) != 2 || states[0].Buttons != ButtonCross {
++		t.Fatalf("press/release order lost: %+v", states)
++	}
++	assertNeutral(t, states[1])
++}
++
++func TestInputQueuePreservesStickActiveNeutralBurst(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	active := leftStickInputState()
++	dev.UpdateInputState(active)
++	dev.UpdateInputState(NewInputState())
++	states := drainInput(dev)
++	if len(states) != 2 || states[0].LY != active.LY {
++		t.Fatalf("stick active/neutral order lost: %+v", states)
++	}
++	assertNeutral(t, states[1])
++}
++
++func TestInputQueueDrainsShortBurstInExactOrder(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	for value := int8(1); value <= 5; value++ {
++		state := NewInputState()
++		state.LY = value
++		dev.UpdateInputState(state)
++	}
++	states := drainInput(dev)
++	if len(states) != 5 {
++		t.Fatalf("drained %d states, want 5", len(states))
++	}
++	for index, state := range states {
++		if state.LY != int8(index+1) {
++			t.Fatalf("state %d LY=%d, want %d", index, state.LY, index+1)
++		}
++	}
++}
++
++func TestInputQueueOverflowRetainsNewestOrderedTail(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	const published = inputQueueCapacity + 4
++	for value := 0; value < published; value++ {
++		state := NewInputState()
++		state.LY = int8(value)
++		dev.UpdateInputState(state)
++	}
++	states := drainInput(dev)
++	if len(states) != inputQueueCapacity {
++		t.Fatalf("retained %d states, want %d", len(states), inputQueueCapacity)
++	}
++	for index, state := range states {
++		want := int8(published - inputQueueCapacity + index)
++		if state.LY != want {
++			t.Fatalf("retained state %d LY=%d, want %d", index, state.LY, want)
++		}
++	}
++	telemetry := dev.InputQueueTelemetry()
++	if telemetry.OverflowDropped != 4 || telemetry.HighWater != inputQueueCapacity {
++		t.Fatalf("overflow telemetry=%+v", telemetry)
++	}
++}
++
++func TestInputQueueSteadyStateServicingHasNoOverflow(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	for value := 0; value < 128; value++ {
++		state := NewInputState()
++		state.LY = int8(value)
++		dev.UpdateInputState(state)
++		states := drainInput(dev)
++		if len(states) != 1 || states[0].LY != int8(value) {
++			t.Fatalf("service %d delivered %+v", value, states)
++		}
++	}
++	telemetry := dev.InputQueueTelemetry()
++	if telemetry.OverflowDropped != 0 || len(dev.inputCh) != 0 || telemetry.HighWater > 1 {
++		t.Fatalf("steady state telemetry=%+v depth=%d", telemetry, len(dev.inputCh))
++	}
++}
++
++func TestInputQueueAudioAndMicrophoneResetsPreserveTransitions(t *testing.T) {
++	for _, endpoint := range []uint8{EndpointHapticsAudioOut, EndpointMicrophoneIn} {
++		t.Run("endpoint", func(t *testing.T) {
++			dev := newQueueTestDevice(t)
++			dev.UpdateInputState(crossInputState())
++			dev.UpdateInputState(NewInputState())
++			dev.ResetEndpoint(endpoint)
++			states := drainInput(dev)
++			if len(states) != 2 || states[0].Buttons != ButtonCross {
++				t.Fatalf("endpoint %#x erased transition: %+v", endpoint, states)
++			}
++			assertNeutral(t, states[1])
++		})
++	}
++}
++
++func TestInputQueueGamepadResetRepublishesLatestExactlyOnce(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	dev.UpdateInputState(NewInputState())
++	latest := crossInputState()
++	latest.LY = 37
++	dev.UpdateInputState(latest)
++	dev.ResetEndpoint(EndpointIn)
++	states := drainInput(dev)
++	if len(states) != 1 || states[0] != *latest {
++		t.Fatalf("gamepad reset queued %+v, want exactly latest %+v", states, *latest)
++	}
++}
++
++func TestResetInputStateForStreamEndNeutralizesCrossAndStick(t *testing.T) {
++	for _, active := range []struct {
++		name  string
++		state *InputState
++	}{
++		{"cross", crossInputState()},
++		{"ly", leftStickInputState()},
++	} {
++		t.Run(active.name, func(t *testing.T) {
++			dev := newQueueTestDevice(t)
++			dev.UpdateInputState(active.state)
++			dev.ResetInputStateForStreamEnd()
++			dev.mtx.Lock()
++			latest := dev.inputState
++			dev.mtx.Unlock()
++			assertNeutral(t, latest)
++			states := drainInput(dev)
++			if len(states) != 1 {
++				t.Fatalf("stream end queued %d states", len(states))
++			}
++			assertNeutral(t, states[0])
++		})
++	}
++}
++
++func TestInputQueueConcurrentPublishersRemainNonBlocking(t *testing.T) {
++	dev := newQueueTestDevice(t)
++	var publishers sync.WaitGroup
++	for publisher := 0; publisher < 4; publisher++ {
++		publishers.Add(1)
++		go func(offset int) {
++			defer publishers.Done()
++			for value := 0; value < 128; value++ {
++				state := NewInputState()
++				state.LY = int8(offset + value)
++				dev.UpdateInputState(state)
++			}
++		}(publisher)
++	}
++	done := make(chan struct{})
++	go func() {
++		publishers.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("concurrent publishers blocked")
++	}
++	telemetry := dev.InputQueueTelemetry()
++	if len(dev.inputCh) > inputQueueCapacity || telemetry.HighWater > inputQueueCapacity {
++		t.Fatalf("bounded queue violated: depth=%d telemetry=%+v", len(dev.inputCh), telemetry)
++	}
++}
+

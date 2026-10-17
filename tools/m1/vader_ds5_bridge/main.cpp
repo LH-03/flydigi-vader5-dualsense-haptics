@@ -72,6 +72,7 @@ constexpr bool InputStreamMustStop(int64_t ageUs)
 
 std::string g_viiperExe;
 bool g_nodelay = false;
+bool g_inputDiagnostics = false;
 HANDLE g_bridgeStopEvent = nullptr;
 
 // DS5 payload constants (VIIPER device/dualsense/state.go + const.go).
@@ -421,10 +422,10 @@ uint32_t Crc32(const uint8_t* data, size_t size)
     return crc ^ 0xFFFFFFFFu;
 }
 
-std::vector<uint8_t> BuildVpcmInputFrame(uint32_t sequence,
+std::array<uint8_t, 49> BuildVpcmInputFrame(uint32_t sequence,
     const uint8_t payload[33])
 {
-    std::vector<uint8_t> frame(16 + 33);
+    std::array<uint8_t, 49> frame{};
     frame[0] = 'V';
     frame[1] = 'P';
     frame[2] = 'C';
@@ -1825,6 +1826,12 @@ bool CreatePersona(BridgeState& state, SOCKET& stream)
     std::string portStr = FindJsonValue(response, "usbipPort");
     state.usbipPort = portStr.empty() ? -1 : std::atoi(portStr.c_str());
     std::printf("device add -> %s\n", response.c_str());
+    if (FindJsonValue(response, "vaderhapticsInputRevision") != "1" ||
+        FindJsonValue(response, "inputQueueCapacity") != "8") {
+        std::printf("ERROR: VIIPER input queue fix is missing; install the supported runtime build before playing\n");
+        return false;
+    }
+    std::printf("VIIPER input queue compatibility: PASS revision=1 capacity=8\n");
 
     stream = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in addr = {};
@@ -2051,21 +2058,53 @@ int RunMi01ReadSelfTest()
         for (int i = 0; i < 8; ++i) pass = (source.Poll(state) == InputPollResult::NoSample) && pass;
         uint8_t report[33] = {0, 0x5A, 0xA5, 0xEF};
         report[12] = 0x10; // physical A -> Cross, held throughout all samples
-        for (int i = 0; i < 20; ++i) {
+        auto readButtons = [&]() {
+            uint8_t payload[33] = {};
+            MapToDs5(state, payload);
+            const auto frame = BuildVpcmInputFrame(1, payload);
+            return static_cast<uint32_t>(frame[20]) | (static_cast<uint32_t>(frame[21]) << 8)
+                | (static_cast<uint32_t>(frame[22]) << 16) | (static_cast<uint32_t>(frame[23]) << 24);
+        };
+        for (int i = 0; i < 5000; ++i) {
             DWORD written = 0;
             pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && written == sizeof(report) && pass;
-            pass = (source.Poll(state) == InputPollResult::Sample && state.a) && pass;
+            pass = (source.Poll(state) == InputPollResult::Sample && readButtons() == kBtnCross) && pass;
         }
         report[12] = 0;
         DWORD written = 0;
         pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
         pass = (source.Poll(state) == InputPollResult::Sample && !state.a) && pass;
+        for (int tap = 0; tap < 1000; ++tap) {
+            for (const auto button : {uint8_t{0x10}, uint8_t{0}}) {
+                report[12] = button;
+                pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+                pass = (source.Poll(state) == InputPollResult::Sample
+                    && readButtons() == (button ? kBtnCross : 0)) && pass;
+            }
+        }
+        report[12] = 0x50; // A + View
+        report[13] = 0x02; // Options
+        report[16] = report[17] = 255; // both triggers
+        pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+        pass = (source.Poll(state) == InputPollResult::Sample
+            && readButtons() == (kBtnCross | kBtnTouchpad | kBtnOptions | kBtnL2 | kBtnR2)) && pass;
+        report[12] = 0x10;
+        report[13] = report[16] = report[17] = 0;
+        pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+        pass = (source.Poll(state) == InputPollResult::Sample && readButtons() == kBtnCross) && pass;
+        report[3] = 0x1C; // renewal reply must not create a release or press
+        pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+        pass = (source.Poll(state) == InputPollResult::NoSample && readButtons() == kBtnCross) && pass;
+        report[3] = 0xEF;
+        report[12] = 0;
+        pass = WriteFile(writer, report, sizeof(report), &written, nullptr) && pass;
+        pass = (source.Poll(state) == InputPollResult::Sample && readButtons() == 0) && pass;
         // Destruction must cancel/complete a still-pending read without a peer write.
         pass = (source.Poll(state) == InputPollResult::NoSample) && pass;
     }
     CloseHandle(writer);
     CloseHandle(pipe);
-    std::printf("MI01_READ_SELFTEST result=%s pending_timeout_hold_release_cleanup\n", pass ? "PASS" : "FAIL");
+    std::printf("MI01_READ_SELFTEST result=%s held_frames=5000 tap_pairs=1000 checks=chords,renewal_filter,pending_cleanup\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
 
@@ -2510,6 +2549,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
     outputBackend.Enqueue(initialZero);
 
     M3LiveTelemetry telemetry;
+    telemetry.processingNs.reserve(4096);
     vaderhaptics::VpcmParser::FrameCallback onFrame =
         [&](const vaderhaptics::VpcmFrame& frame) {
             if (frame.type != 0x84) {
@@ -2554,10 +2594,12 @@ int RunBridge(int durationSeconds, const std::string& configPath,
                 drive.timestampUs = block.timestampUs;
             }
             const auto processEnd = std::chrono::steady_clock::now();
-            telemetry.processingNs.push_back(static_cast<uint64_t>(
+            const auto processingNs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     processEnd - processStart)
-                    .count()));
+                    .count());
+            if (telemetry.processingNs.size() < 4096) telemetry.processingNs.push_back(processingNs);
+            else telemetry.processingNs[telemetry.rendererProcessed % 4096] = processingNs;
             ++telemetry.rendererProcessed;
             telemetry.last0x84Us = std::chrono::duration_cast<
                 std::chrono::microseconds>(processEnd - start).count();
@@ -2638,7 +2680,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
                 const int64_t recoveredUs = std::chrono::duration_cast<
                     std::chrono::microseconds>(now - lastInputSample).count();
                 maxInputGapUs = std::max(maxInputGapUs, recoveredUs);
-                std::printf(
+                if (g_inputDiagnostics) std::printf(
                     "ordinary input source '%s' recovered after %lld us; "
                     "resuming live input and haptics\n",
                     inputSource->name(), static_cast<long long>(recoveredUs));
@@ -2661,7 +2703,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
                 break;
             }
             if (InputStreamNeedsNeutral(staleUs) && !inputFailsafeActive) {
-                std::printf(
+                if (g_inputDiagnostics) std::printf(
                     "WARNING: ordinary input source '%s' produced no sample "
                     "for %lld us; sending neutral input and zero haptics while "
                     "waiting for recovery\n",
@@ -2720,8 +2762,8 @@ int RunBridge(int durationSeconds, const std::string& configPath,
             const bool lyActive =
                 std::abs(static_cast<int>(inputState.ly)) >= 16384;
             const bool lyChanged = lyActive != lastEdgeLyActive;
-            if (buttonsChanged || dpadChanged || vendorButtonsChanged ||
-                lyChanged) {
+            if (g_inputDiagnostics && (buttonsChanged || dpadChanged || vendorButtonsChanged ||
+                lyChanged)) {
                 std::printf(
                     "EDGE t=%6.3f source=%s buttons=0x%04X dpad=0x%02X "
                     "vendor=0x%02X ly=%d\n",
@@ -2786,9 +2828,9 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         // renderer and the bounded output backend.
         u_long available = 0;
         if (ioctlsocket(stream, FIONREAD, &available) == 0 && available > 0) {
-            std::vector<char> buffer(available);
+            std::array<char, 16384> buffer;
             int n = recv(stream, buffer.data(),
-                static_cast<int>(buffer.size()), 0);
+                static_cast<int>((std::min)(static_cast<u_long>(buffer.size()), available)), 0);
             if (n > 0) {
                 feedbackBytes += static_cast<uint64_t>(n);
                 parser.Feed(
@@ -2821,7 +2863,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
             telemetry.last0x84Us = nowUs;
         }
 
-        if (now - lastDiag >= std::chrono::seconds(1)) {
+        if (g_inputDiagnostics && now - lastDiag >= std::chrono::seconds(1)) {
             lastDiag = now;
             std::printf(
                 "[t=%6.1fs] inputSource=%s inputSamples=%llu sentFrames=%llu "
@@ -4743,7 +4785,9 @@ int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (g_viiperExe.empty()) {
-        g_viiperExe = ExpandEnv("%LOCALAPPDATA%\\VIIPER\\viiper.exe");
+        wchar_t executable[32768] = {};
+        GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+        g_viiperExe = (std::filesystem::path(executable).parent_path() / L"runtime" / L"viiper.exe").string();
     }
     std::string command = argc > 1 ? argv[1] : "run";
     if (command == "startup-selftest") return RunViiperStartupSelfTest();
@@ -4772,6 +4816,9 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--nodelay") == 0) {
             g_nodelay = true;
+        }
+        else if (std::strcmp(argv[i], "--input-diagnostics") == 0) {
+            g_inputDiagnostics = true;
         }
         else if (std::strcmp(argv[i], "--motor-output") == 0 && i + 1 < argc) {
             const char* value = argv[++i];

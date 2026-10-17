@@ -361,14 +361,11 @@ bool EnsureSpaceStation()
 
 bool CheckEnhancedFiles()
 {
-    wchar_t localAppData[32768] = {};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData,
-        static_cast<DWORD>(std::size(localAppData)));
     const std::pair<std::filesystem::path, const wchar_t*> required[] = {
         {BridgePath(), L"缺少桥接程序，请重新解压完整程序包。"},
         {ConfigPath(), L"缺少震动配置，请重新解压完整程序包。"},
-        {std::filesystem::path(localAppData) / L"VIIPER" / L"viiper.exe",
-            L"未找到 VIIPER，请按安装说明安装 v0.0.9 兼容运行时。"},
+        {ExecutableDirectory() / L"runtime" / L"viiper.exe",
+            L"缺少输入修复版运行时，请按安装说明补齐 runtime 文件夹。"},
         {L"C:\\Program Files\\Nefarius Software Solutions\\HidHide\\x64\\HidHideCLI.exe",
             L"未找到 HidHide，请按安装说明安装后重试。"}
     };

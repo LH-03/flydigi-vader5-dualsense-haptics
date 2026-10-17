@@ -105,5 +105,11 @@ Copy-Item -LiteralPath (Join-Path $root 'README.zh-CN.md') -Destination (Join-Pa
 Copy-Item -LiteralPath (Join-Path $root 'docs\INSTALL.zh-CN.md') -Destination (Join-Path $stage 'INSTALL.zh-CN.md')
 Copy-Item -LiteralPath (Join-Path $root 'NOTICE.md') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
+if (Test-Path -LiteralPath (Join-Path $root 'runtime/viiper.exe')) {
+    Copy-Item -LiteralPath (Join-Path $root 'runtime') -Destination $stage -Recurse
+}
+else {
+    Write-Warning 'The package needs runtime/viiper.exe from scripts/Build-Viiper.ps1 before PS5 Enhanced can start.'
+}
 
 Write-Host "Release package ready: $stage"
