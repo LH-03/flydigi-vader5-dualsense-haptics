@@ -23,6 +23,9 @@ std::wstring RelevantLines(std::string_view log)
         // Include only failure/recovery evidence in the UI and clipboard.
         if (line.find("ERROR:") != line.npos || line.find("error:") != line.npos ||
             line.find(" ERROR ") != line.npos || line.find("reject:") != line.npos ||
+            line.find("MI01_READ_SUMMARY ") != line.npos ||
+            line.find("INPUT_LOOP_SUMMARY ") != line.npos ||
+            line.find("INPUT_GAP ") != line.npos ||
             line.find("MODE_NATIVE result=") != line.npos) {
             result += Wide(line) + L"\r\n";
         }

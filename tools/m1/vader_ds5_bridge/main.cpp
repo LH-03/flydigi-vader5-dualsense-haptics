@@ -1941,6 +1941,7 @@ public:
     virtual const char* name() const = 0;
     virtual int deviceIndex() const = 0;
     virtual InputPollResult Poll(NormalizedInputState& state) = 0;
+    virtual void PrintDiagnostics() const {}
 };
 
 class Mi01OrdinaryInputSource final : public OrdinaryInputSource
@@ -1982,6 +1983,17 @@ public:
         return -1;
     }
 
+    void PrintDiagnostics() const override
+    {
+        std::printf("MI01_READ_SUMMARY completed=%llu decoded=%llu filtered=%llu "
+                    "poll_timeouts=%llu last_command=0x%02X last_read_error=%lu\n",
+            static_cast<unsigned long long>(completed_),
+            static_cast<unsigned long long>(decoded_),
+            static_cast<unsigned long long>(filtered_),
+            static_cast<unsigned long long>(timeouts_),
+            static_cast<unsigned>(lastCommand_), lastReadError_);
+    }
+
     InputPollResult Poll(NormalizedInputState& state) override
     {
         if (handle_ == INVALID_HANDLE_VALUE || !read_.hEvent) return InputPollResult::Disconnected;
@@ -1997,6 +2009,7 @@ public:
             ResetEvent(read_.hEvent);
             if (!ReadFile(handle_, report_.data(), static_cast<DWORD>(report_.size()), nullptr, &read_)
                 && GetLastError() != ERROR_IO_PENDING) {
+                lastReadError_ = GetLastError();
                 return InputPollResult::Disconnected;
             }
             pending_ = true;
@@ -2004,19 +2017,26 @@ public:
         // Keep the same read alive across short polling timeouts. Cancelling
         // every 4 ms needlessly restarts the pending transfer under load.
         if (WaitForSingleObject(read_.hEvent, 4) == WAIT_TIMEOUT) {
+            ++timeouts_;
             return InputPollResult::NoSample;
         }
         DWORD bytesRead = 0;
         if (!GetOverlappedResult(handle_, &read_, &bytesRead, FALSE)) {
-            if (GetLastError() == ERROR_IO_INCOMPLETE) return InputPollResult::NoSample;
+            const DWORD error = GetLastError();
+            if (error == ERROR_IO_INCOMPLETE) return InputPollResult::NoSample;
+            lastReadError_ = error;
             pending_ = false;
             return InputPollResult::Disconnected;
         }
         pending_ = false;
+        ++completed_;
+        lastCommand_ = bytesRead > 3 ? report_[3] : 0xFF;
         VaderState decoded;
         if (!DecodeVaderReport(report_.data(), bytesRead, decoded)) {
+            ++filtered_;
             return InputPollResult::NoSample;
         }
+        ++decoded_;
         state = NormalizeMi01State(decoded);
         if (expansionMappingEnabled_) {
             ApplyFlydigiExpansionKeys(expansionProfile_, state);
@@ -2031,6 +2051,9 @@ private:
     bool pending_ = false;
     VaderState initial_;
     bool initialPending_ = true;
+    uint64_t completed_ = 0, decoded_ = 0, filtered_ = 0, timeouts_ = 0;
+    DWORD lastReadError_ = 0;
+    uint8_t lastCommand_ = 0xFF;
     vaderhaptics::input::FlydigiOnboardProfile expansionProfile_;
     bool expansionMappingEnabled_ = false;
 };
@@ -2101,6 +2124,7 @@ int RunMi01ReadSelfTest()
         pass = (source.Poll(state) == InputPollResult::Sample && readButtons() == 0) && pass;
         // Destruction must cancel/complete a still-pending read without a peer write.
         pass = (source.Poll(state) == InputPollResult::NoSample) && pass;
+        source.PrintDiagnostics();
     }
     CloseHandle(writer);
     CloseHandle(pipe);
@@ -2502,6 +2526,16 @@ int RunBridge(int durationSeconds, const std::string& configPath,
     auto lastDiag = start;
     auto lastSend = start;
     auto lastInputSample = start;
+    auto lastLoopStart = start;
+    int64_t maxLoopGapUs = 0, maxPollUs = 0;
+    struct InputGap { int64_t elapsedMs; int64_t durationUs; bool recovered; };
+    std::array<InputGap, 16> inputGaps{};
+    uint64_t inputGapCount = 0;
+    auto recordInputGap = [&](int64_t durationUs, bool recovered) {
+        inputGaps[inputGapCount++ % inputGaps.size()] = {
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count(), durationUs, recovered};
+    };
     auto nextAxisSample = start;
     auto nextTraceInputSample = start;
 
@@ -2636,6 +2670,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         runtimeFailed = true;
         telemetry.runtimeFailed = true;
     }
+    lastLoopStart = std::chrono::steady_clock::now();
     while (!g_interrupted) {
         if (acquireHeartbeat.failed()) {
             std::printf("ERROR: Vader acquisition renewal failed; stopping safely\n");
@@ -2656,6 +2691,9 @@ int RunBridge(int durationSeconds, const std::string& configPath,
             break;
         }
         auto now = std::chrono::steady_clock::now();
+        maxLoopGapUs = std::max(maxLoopGapUs, static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - lastLoopStart).count()));
+        lastLoopStart = now;
         double elapsed =
             std::chrono::duration<double>(now - start).count();
         if (durationSeconds > 0 && elapsed >= durationSeconds) {
@@ -2663,8 +2701,11 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         }
 
         NormalizedInputState inputState;
+        const auto pollStart = now;
         const InputPollResult pollResult = inputSource->Poll(inputState);
         now = std::chrono::steady_clock::now();
+        maxPollUs = std::max(maxPollUs, static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - pollStart).count()));
         const bool decoded = pollResult == InputPollResult::Sample;
         bool forceNeutralFrame = false;
         if (pollResult == InputPollResult::Disconnected) {
@@ -2680,6 +2721,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
                 const int64_t recoveredUs = std::chrono::duration_cast<
                     std::chrono::microseconds>(now - lastInputSample).count();
                 maxInputGapUs = std::max(maxInputGapUs, recoveredUs);
+                recordInputGap(recoveredUs, true);
                 if (g_inputDiagnostics) std::printf(
                     "ordinary input source '%s' recovered after %lld us; "
                     "resuming live input and haptics\n",
@@ -2693,6 +2735,7 @@ int RunBridge(int durationSeconds, const std::string& configPath,
                 std::chrono::microseconds>(now - lastInputSample).count();
             maxInputGapUs = std::max(maxInputGapUs, staleUs);
             if (InputStreamMustStop(staleUs)) {
+                recordInputGap(staleUs, false);
                 std::printf(
                     "ERROR: ordinary input source '%s' produced no sample "
                     "for %lld us; sustained outage, stopping safely\n",
@@ -3006,6 +3049,17 @@ int RunBridge(int durationSeconds, const std::string& configPath,
         static_cast<unsigned long long>(inputNeutralizations),
         static_cast<long long>(maxInputGapUs));
 
+    inputSource->PrintDiagnostics();
+    std::printf("INPUT_LOOP_SUMMARY max_loop_gap_us=%lld max_poll_us=%lld\n",
+        static_cast<long long>(maxLoopGapUs), static_cast<long long>(maxPollUs));
+    const uint64_t gapStart = inputGapCount > inputGaps.size()
+        ? inputGapCount - inputGaps.size() : 0;
+    for (uint64_t i = gapStart; i < inputGapCount; ++i) {
+        const auto& gap = inputGaps[i % inputGaps.size()];
+        std::printf("INPUT_GAP elapsed_ms=%lld duration_us=%lld recovered=%u\n",
+            static_cast<long long>(gap.elapsedMs), static_cast<long long>(gap.durationUs),
+            gap.recovered ? 1u : 0u);
+    }
     inputSourceStorage.reset();
     std::printf("stopping bridge...\n");
     if (separateOutputHandle) {

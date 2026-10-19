@@ -42,6 +42,15 @@ int main()
     check(report.find(L"secret-do-not-copy") == std::wstring::npos && report.find(L"bind:") != std::wstring::npos
         && report.find(L"MODE_NATIVE result=PASS") != std::wstring::npos,
         "copy report retains failure and recovery without service INFO secrets");
+    const auto inputReport = launcher::DiagnosticDetails(
+        "ERROR: ordinary input source disconnected;\n"
+        "MI01_READ_SUMMARY completed=20 last_read_error=1167\n"
+        "INPUT_LOOP_SUMMARY max_loop_gap_us=4100 max_poll_us=4000\n"
+        "INPUT_GAP elapsed_ms=22000 duration_us=2008890 recovered=0\n", {}, {});
+    check(inputReport.find(L"last_read_error=1167") != std::wstring::npos
+        && inputReport.find(L"max_loop_gap_us=4100") != std::wstring::npos
+        && inputReport.find(L"duration_us=2008890") != std::wstring::npos,
+        "in-app diagnostics retain input read and timing evidence");
     check(launcher::ReadSpaceStationDirectory(ini).empty(), "missing configuration");
     check(!launcher::SaveSpaceStationDirectory(ini, root), "reject wrong folder");
     check(launcher::SaveSpaceStationDirectory(ini, station), "save new Chinese path");
