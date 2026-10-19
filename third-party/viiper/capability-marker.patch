@@ -1,7 +1,47 @@
 diff --git a/device/dualsense/device.go b/device/dualsense/device.go
 --- a/device/dualsense/device.go
 +++ b/device/dualsense/device.go
-@@ -296,1 +296,3 @@
+@@ -293,7 +293,9 @@
+ 	if err != nil {
+ 		return map[string]any{}
+ 	}
  	res["speakerInterfaceActive"] = d.speakerInterfaceActive
 +	res["vaderhapticsInputRevision"] = 1
 +	res["inputQueueCapacity"] = inputQueueCapacity
+ 	speakerState := d.speakerStreamTelemetry.snapshot()
+ 	res["speakerStreamActive"] = speakerState.Active
+ 	res["speakerPayloadsReceived"] = speakerState.ReceivedPayloads
+diff --git a/device/dualsense/vaderhaptics_capability_test.go b/device/dualsense/vaderhaptics_capability_test.go
+new file mode 100644
+--- /dev/null
++++ b/device/dualsense/vaderhaptics_capability_test.go
+@@ -0,0 +1,17 @@
++package dualsense
++
++import "testing"
++
++func TestVaderHapticsInputCapabilities(t *testing.T) {
++	dev, err := New(nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	args := dev.GetDeviceSpecificArgs()
++	if args["vaderhapticsInputRevision"] != 1 {
++		t.Fatalf("missing input revision: %v", args)
++	}
++	if args["inputQueueCapacity"] != 8 || cap(dev.inputCh) != 8 {
++		t.Fatalf("input queue must have capacity 8: metadata=%v actual=%d", args["inputQueueCapacity"], cap(dev.inputCh))
++	}
++}
+diff --git a/internal/server/api/stream_reconnect_test.go b/internal/server/api/stream_reconnect_test.go
+--- a/internal/server/api/stream_reconnect_test.go
++++ b/internal/server/api/stream_reconnect_test.go
+@@ -160,6 +160,8 @@
+ 	created, err := client.DeviceAdd(busID, "dualsensecombinedaudioduplexv5", nil)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, created)
++	require.Equal(t, float64(1), created.DeviceSpecific["vaderhapticsInputRevision"])
++	require.Equal(t, float64(8), created.DeviceSpecific["inputQueueCapacity"])
+ 
+ 	devices := bus.Devices()
+ 	require.Len(t, devices, 1)

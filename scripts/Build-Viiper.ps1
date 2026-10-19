@@ -16,17 +16,26 @@ if (-not (Test-Path -LiteralPath (Join-Path $source 'go.mod'))) {
     Invoke-WebRequest -UseBasicParsing -Uri "https://codeload.github.com/hbashton/VIIPER/zip/$revision" -OutFile $archive
     Expand-Archive -LiteralPath $archive -DestinationPath $work -Force
 }
-foreach ($patch in @('input-queue.patch','capability-marker.patch')) {
-    $path = Join-Path $root "third-party/viiper/$patch"
-    $ErrorActionPreference = 'Continue'
-    & git -C $source apply --reverse --check $path 2>$null
-    $ErrorActionPreference = 'Stop'
-    if ($LASTEXITCODE -ne 0) {
-        & git -C $source apply --check $path
-        if ($LASTEXITCODE -ne 0) { throw "Patch does not match pinned source: $patch" }
-        & git -C $source apply $path
-        if ($LASTEXITCODE -ne 0) { throw "Patch failed: $patch" }
+$savedCeiling = $env:GIT_CEILING_DIRECTORIES
+try {
+    # The source ZIP is often extracted inside another Git checkout. Without a
+    # ceiling, git apply can silently skip every patch relative to that parent.
+    $env:GIT_CEILING_DIRECTORIES = Split-Path -Parent $source
+    foreach ($patch in @('input-queue.patch','capability-marker.patch')) {
+        $path = Join-Path $root "third-party/viiper/$patch"
+        $ErrorActionPreference = 'Continue'
+        & git -C $source apply --reverse --check $path 2>$null
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE -ne 0) {
+            & git -C $source apply --check $path
+            if ($LASTEXITCODE -ne 0) { throw "Patch does not match pinned source: $patch" }
+            & git -C $source apply $path
+            if ($LASTEXITCODE -ne 0) { throw "Patch failed: $patch" }
+        }
     }
+} finally { $env:GIT_CEILING_DIRECTORIES = $savedCeiling }
+if (-not (Test-Path -LiteralPath (Join-Path $source 'device/dualsense/vaderhaptics_capability_test.go'))) {
+    throw 'VIIPER capability patch was not applied; refusing to build an unpatched runtime.'
 }
 Push-Location $source
 try {
